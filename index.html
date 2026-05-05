@@ -65,18 +65,19 @@
       <h2>3. Download options</h2>
       <div class="row">
         <label>
+          <span>Download type</span>
           <select id="download-type">
-               <option value="both" selected>both</option>
-               <option value="input">input</option>
-               <option value="output">output</option>
-             </select>
+            <option value="both" selected>both</option>
+            <option value="input">input</option>
+            <option value="output">output</option>
+          </select>
         </label>
 
         <label>
           <span>Format</span>
           <select id="format-type">
             <option value="zip" selected>zip</option>
-            <option value="pdf">pdf</option>
+            <option value="folder">folder</option>
           </select>
         </label>
 
@@ -89,7 +90,7 @@
           <span>Product</span>
           <select id="download-product">
             <option value="CATALOG" selected>CATALOG</option>
-            <!-- <option value="DAM">DAM</option> -->
+            <option value="DAM">DAM</option>
           </select>
         </label>
       </div>
@@ -97,6 +98,7 @@
 
     <section class="actions">
       <button id="download-btn" class="primary">Download</button>
+      <button id="refetch-btn" class="ghost" hidden title="Retry per-media downloads using the most recent request ID">Re-fetch downloads</button>
       <button id="clear-creds-btn" class="ghost" title="Clear saved credentials">Clear saved credentials</button>
     </section>
 
