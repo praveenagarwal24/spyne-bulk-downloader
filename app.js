@@ -438,10 +438,10 @@ async function downloadEachMedia(rows, requestId, token) {
   );
 }
 
-// Set after a successful POST so the user can re-fetch downloads later
-// (e.g., once the bulk job finishes processing) without re-submitting.
-let lastRequestId = null;
+// Set after a successful run so the user can re-fetch downloads later
+// (e.g., once the per-VIN jobs finish) without re-submitting.
 let lastRows = [];
+let lastRequestIdsByMedia = new Map(); // mediaId -> requestId
 
 /** Try to make a download happen from whatever shape the API responds with. */
 async function handleResponse(res, token) {
@@ -536,51 +536,113 @@ async function onDownloadClick() {
   if (!parsedRows.length) return log("Upload a CSV with at least one media ID.", "err");
 
   saveCreds();
+  lastRows = parsedRows.slice();
+  lastRequestIdsByMedia = new Map();
 
-  log(`Submitting ${parsedRows.length} media ID(s) to Spyne…`);
-  if (parsedRows.length <= 20) {
-    parsedRows.forEach((r) =>
-      log(`  • ${r.mediaId}${r.vin ? `  (VIN ${r.vin})` : ""}`)
-    );
-  }
+  log(
+    `Will process ${parsedRows.length} VIN${parsedRows.length === 1 ? "" : "s"} ` +
+    `sequentially, one POST per VIN (one ZIP per VIN, with images sequenced inside).`
+  );
 
   els.downloadBtn.disabled = true;
+  els.refetchBtn.hidden = false;
+  const startMs = Date.now();
+  let succeeded = 0, failed = 0;
+
   try {
-    const payload = buildPayload(parsedRows.map((r) => r.mediaId));
-    const res = await callBulkDownload(payload, token);
-    await handleResponse(res, token);
-  } catch (e) {
-    if (e.message?.includes("Failed to fetch") || e.name === "TypeError") {
-      log(
-        "Network/CORS error. Most likely Spyne's API rejected the cross-origin call. " +
-        "See README.md → 'CORS proxy setup' for the 5-minute Cloudflare Worker fix.",
-        "err"
-      );
-    } else {
-      log(`Error: ${e.message}`, "err");
+    for (let i = 0; i < parsedRows.length; i++) {
+      const row = parsedRows[i];
+      const label = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
+      log(`[${i + 1}/${parsedRows.length}] Submitting ${label}…`);
+
+      try {
+        // POST with just this single mediaId so Spyne creates a per-VIN bulk job.
+        const payload = buildPayload([row.mediaId]);
+        const postRes = await callBulkDownload(payload, token);
+
+        if (!postRes.ok) {
+          const text = await postRes.text().catch(() => postRes.statusText);
+          log(`[${i + 1}/${parsedRows.length}]   ✗ POST HTTP ${postRes.status} — ${text.slice(0, 220)}`, "err");
+          failed++;
+          continue;
+        }
+
+        const json = await postRes.json().catch(() => null);
+        const requestId =
+          json?.data?.requestId || json?.requestId || json?.jobId || json?.data?.jobId;
+
+        if (!requestId) {
+          log(`[${i + 1}/${parsedRows.length}]   ✗ POST returned no requestId: ${JSON.stringify(json).slice(0, 220)}`, "err");
+          failed++;
+          continue;
+        }
+
+        lastRequestIdsByMedia.set(row.mediaId, requestId);
+        log(`[${i + 1}/${parsedRows.length}]   POST OK — requestId ${requestId}. Polling…`);
+
+        const ok = await pollAndDownloadOne(row, requestId, token, i, parsedRows.length);
+        if (ok) succeeded++; else failed++;
+      } catch (e) {
+        if (e.message?.includes("Failed to fetch") || e.name === "TypeError") {
+          log(`[${i + 1}/${parsedRows.length}]   ✗ Network/CORS error. See README → CORS proxy setup.`, "err");
+        } else {
+          log(`[${i + 1}/${parsedRows.length}]   ✗ ${e.message}`, "err");
+        }
+        failed++;
+      }
+
+      // Pause between VINs so the browser starts saving the previous ZIP first.
+      if (i < parsedRows.length - 1) {
+        log(`  Waiting ${(SEQUENTIAL_DOWNLOAD_DELAY_MS / 1000).toFixed(1)}s before next VIN…`);
+        await new Promise((r) => setTimeout(r, SEQUENTIAL_DOWNLOAD_DELAY_MS));
+      }
     }
-    console.error(e);
   } finally {
     els.downloadBtn.disabled = false;
   }
+
+  const totalSec = ((Date.now() - startMs) / 1000).toFixed(1);
+  log(
+    `All VINs processed in ${totalSec}s. Success=${succeeded}  Failure=${failed}`,
+    failed ? "warn" : "ok"
+  );
 }
 
 // ---------- wire up ----------
 
 async function onRefetchClick() {
-  if (!lastRequestId || !lastRows.length) {
-    log("No previous request to re-fetch. Click Download first.", "warn");
+  if (!lastRequestIdsByMedia.size || !lastRows.length) {
+    log("No previous run to re-fetch. Click Download first.", "warn");
     return;
   }
   const token = els.authToken.value.trim();
   if (!token) return log("Authorization token is required.", "err");
+
   els.refetchBtn.disabled = true;
+  const startMs = Date.now();
+  let succeeded = 0, failed = 0;
   try {
-    log(`Re-fetching downloads for request ID ${lastRequestId}…`);
-    await downloadEachMedia(lastRows, lastRequestId, token);
+    log(`Re-fetching ${lastRows.length} VIN${lastRows.length === 1 ? "" : "s"} using previously-saved request IDs…`);
+    for (let i = 0; i < lastRows.length; i++) {
+      const row = lastRows[i];
+      const requestId = lastRequestIdsByMedia.get(row.mediaId);
+      if (!requestId) {
+        log(`[${i + 1}/${lastRows.length}]   ✗ No saved requestId for ${row.mediaId}; click Download to start fresh.`, "err");
+        failed++;
+        continue;
+      }
+      log(`[${i + 1}/${lastRows.length}] Re-checking ${row.mediaId}${row.vin ? ` (VIN ${row.vin})` : ""}…`);
+      const ok = await pollAndDownloadOne(row, requestId, token, i, lastRows.length);
+      if (ok) succeeded++; else failed++;
+      if (i < lastRows.length - 1) {
+        await new Promise((r) => setTimeout(r, SEQUENTIAL_DOWNLOAD_DELAY_MS));
+      }
+    }
   } finally {
     els.refetchBtn.disabled = false;
   }
+  const totalSec = ((Date.now() - startMs) / 1000).toFixed(1);
+  log(`Re-fetch done in ${totalSec}s. Success=${succeeded}  Failure=${failed}`, failed ? "warn" : "ok");
 }
 
 document.addEventListener("DOMContentLoaded", () => {
