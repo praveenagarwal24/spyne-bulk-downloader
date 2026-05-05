@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Spyne Bulk Media Downloader</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1>Spyne Bulk Media Downloader</h1>
+      <p class="subtitle">
+        Upload a CSV of media IDs, paste your Spyne credentials, hit Download.
+        Calls <code>api.spyne.ai/medias/bulk-download</code> directly from your browser.
+      </p>
+    </header>
+
+    <section class="card">
+      <h2>1. Your Spyne credentials</h2>
+      <p class="hint">
+        Open <a href="https://console.spyne.ai" target="_blank" rel="noopener">console.spyne.ai</a>,
+        log in, then open DevTools&nbsp;→&nbsp;Network tab. Trigger any action,
+        click any request, and copy the values. They're saved locally in your browser.
+      </p>
+
+      <label>
+        <span>Authorization token <small class="muted">(without "Bearer ")</small></span>
+        <textarea id="auth-token" rows="2" placeholder="eyJhbGciOi..."></textarea>
+        <small id="token-meta" class="muted"></small>
+      </label>
+
+      <div class="row">
+        <label>
+          <span>Enterprise ID</span>
+          <input id="enterprise-id" placeholder="e.g. 82255fce5" autocomplete="off" />
+        </label>
+
+        <label>
+          <span>Team ID</span>
+          <input id="team-id" placeholder="e.g. e0b1ded2d8" autocomplete="off" />
+        </label>
+
+        <label>
+          <span>User ID <small class="muted">(optional)</small></span>
+          <input id="user-id" placeholder="leave blank if unsure" autocomplete="off" />
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>2. Media IDs (CSV upload)</h2>
+      <p class="hint">
+        CSV must contain a column named <code>Media ID</code> (case-insensitive; also accepts
+        <code>mediaId</code>, <code>media_id</code>). Optional columns: <code>VIN</code> /
+        <code>Sku Name</code> for human-readable labels in the status output.
+      </p>
+
+      <input type="file" id="csv-file" accept=".csv,text/csv" />
+      <a href="sample.csv" download class="link">Download a sample CSV</a>
+      <div id="csv-summary" class="muted"></div>
+    </section>
+
+    <section class="card">
+      <h2>3. Download options</h2>
+      <div class="row">
+        <label>
+          <span>Download type</span>
+          <select id="download-type">
+            <option value="both" selected>both</option>
+            <option value="image">image</option>
+            <option value="video">video</option>
+          </select>
+        </label>
+
+        <label>
+          <span>Format</span>
+          <select id="format-type">
+            <option value="zip" selected>zip</option>
+            <option value="folder">folder</option>
+          </select>
+        </label>
+
+        <label class="checkbox">
+          <input type="checkbox" id="is-sequence" checked />
+          <span>Sequence (download sequentially)</span>
+        </label>
+
+        <label>
+          <span>Product</span>
+          <select id="download-product">
+            <option value="CATALOG" selected>CATALOG</option>
+            <option value="DAM">DAM</option>
+          </select>
+        </label>
+      </div>
+    </section>
+
+    <section class="actions">
+      <button id="download-btn" class="primary">Download</button>
+      <button id="clear-creds-btn" class="ghost" title="Clear saved credentials">Clear saved credentials</button>
+    </section>
+
+    <section class="card output" id="output-card" hidden>
+      <h2>Status</h2>
+      <pre id="output"></pre>
+    </section>
+
+    <footer>
+      <small>
+        Calls api.spyne.ai directly. If you see a CORS error in the browser console,
+        Spyne's API only accepts requests from <code>console.spyne.ai</code>; you'll need a
+        small proxy (see <a href="README.md">README</a>) to relay the request.
+      </small>
+    </footer>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
