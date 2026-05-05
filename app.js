@@ -287,25 +287,57 @@ async function fetchPerMediaDownload(row, requestId, token, { quiet = false } = 
 
   if (ctype.includes("application/json")) {
     const json = await res.json().catch(() => null);
-    const downloadUrl =
-      json?.data?.downloadUrl ||
-      json?.data?.url ||
-      json?.data?.signedUrl ||
-      json?.downloadUrl ||
-      json?.url ||
-      json?.signedUrl;
-    const status = (json?.data?.status || json?.status || "").toLowerCase();
+    const overallStatus = (json?.data?.status || json?.status || "").toLowerCase();
+    const products = json?.data?.products || json?.products;
+    const PENDING_STATES = ["pending", "in_progress", "yet_to_start", "queued", "processing"];
+
+    // Spyne's per-media GET response shape is:
+    //   { data: { status: "COMPLETED", products: { CATALOG: { status: "COMPLETED", url: "https://..." } } } }
+    // Hunt for the first product with a usable download URL.
+    let downloadUrl = null;
+    let anyProductPending = false;
+    if (products && typeof products === "object") {
+      // Prefer the product the user actually selected.
+      const preferredKey = els.downloadProduct?.value;
+      const orderedKeys = preferredKey && products[preferredKey]
+        ? [preferredKey, ...Object.keys(products).filter((k) => k !== preferredKey)]
+        : Object.keys(products);
+      for (const key of orderedKeys) {
+        const p = products[key] || {};
+        const purl = p.url || p.downloadUrl || p.signedUrl;
+        const pstatus = (p.status || "").toLowerCase();
+        if (typeof purl === "string" && purl.startsWith("http")) {
+          downloadUrl = purl;
+          break;
+        }
+        if (PENDING_STATES.includes(pstatus)) anyProductPending = true;
+      }
+    }
+    // Fallback to flat URL fields if products didn't yield one.
+    if (!downloadUrl) {
+      downloadUrl =
+        json?.data?.downloadUrl ||
+        json?.data?.url ||
+        json?.data?.signedUrl ||
+        json?.downloadUrl ||
+        json?.url ||
+        json?.signedUrl ||
+        null;
+    }
 
     if (typeof downloadUrl === "string" && downloadUrl.startsWith("http")) {
       window.open(downloadUrl, "_blank", "noopener");
       log(`  ✓ ${label}: download URL opened`, "ok");
       return RESULT_DOWNLOADED;
     }
-    if (["pending", "in_progress", "yet_to_start", "queued", "processing"].includes(status)) {
-      if (!quiet) log(`  ⋯ ${label}: still preparing (${status}). Will retry.`, "warn");
+
+    if (PENDING_STATES.includes(overallStatus) || anyProductPending) {
+      if (!quiet) log(`  ⋯ ${label}: still preparing (${overallStatus || "in_progress"}). Will retry.`, "warn");
       return RESULT_PENDING;
     }
-    log(`  ? ${label}: ${JSON.stringify(json).slice(0, 240)}`, "warn");
+
+    // Completed but no URL — surface the response so we can extend the parser.
+    log(`  ! ${label}: ${JSON.stringify(json).slice(0, 280)}`, "err");
     return RESULT_FAILED;
   }
 
