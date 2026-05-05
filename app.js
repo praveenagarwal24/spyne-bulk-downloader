@@ -16,7 +16,7 @@ const POST_TO_GET_DELAY_MS = 1500;
 
 // ---------- helpers ----------
 
-const $ = (id) => document.getElementById(id);
+const $ = (id) => document.getElementById(id); 
 
 const els = {
   authToken: $("auth-token"),
