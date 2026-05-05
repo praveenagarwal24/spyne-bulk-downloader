@@ -9,16 +9,17 @@ const PER_MEDIA_URL = (mediaId, requestId) =>
   `https://api.spyne.ai/medias/${encodeURIComponent(mediaId)}/download/${encodeURIComponent(requestId)}`;
 const STORAGE_KEY = "spyne-bulk-downloader/v1";
 
-// How many per-media GETs run in parallel. 4 is a good middle ground for
-// 20–30 VIN batches without hammering the API.
-const FETCH_CONCURRENCY = 4;
-
-// Wait between successive polling cycles when items are still pending.
-// Starts short and backs off if Spyne is slow.
+// Wait between successive polling cycles while items are still pending.
+// Starts short and backs off if Spyne stays "in_progress" for a while.
 const POLL_INTERVALS_MS = [3_000, 5_000, 10_000, 15_000, 30_000];
 
 // Hard ceiling on total polling time so the UI doesn't loop forever.
 const POLL_MAX_MS = 15 * 60 * 1000; // 15 minutes
+
+// Delay after a successful download trigger before moving to the next VIN.
+// Gives the browser time to actually start saving the previous ZIP without
+// triggering popup-blocker collisions.
+const SEQUENTIAL_DOWNLOAD_DELAY_MS = 2_000;
 
 // ---------- helpers ----------
 
@@ -353,107 +354,87 @@ async function fetchPerMediaDownload(row, requestId, token, { quiet = false } = 
   return RESULT_DOWNLOADED;
 }
 
-/** Run an async fn over `items` with at most `concurrency` in flight at once.
- *  Returns the results in original order. */
-async function runWithConcurrency(items, concurrency, fn) {
-  const results = new Array(items.length);
-  let next = 0;
-  async function worker() {
-    while (next < items.length) {
-      const i = next++;
-      try {
-        results[i] = await fn(items[i], i);
-      } catch (e) {
-        results[i] = { __error: e };
-      }
-    }
-  }
-  await Promise.all(Array(Math.min(concurrency, items.length)).fill(0).map(worker));
-  return results;
-}
+/** Poll a single VIN's per-media GET until its ZIP is ready, then trigger one
+ *  download. Returns true on success, false on hard failure or timeout.
+ */
+async function pollAndDownloadOne(row, requestId, token, idx, total) {
+  const label = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
+  const prefix = `[${idx + 1}/${total}]`;
 
-/** Drive per-media downloads for all rows, polling pending ones until done or
- *  POLL_MAX_MS elapses. No arbitrary up-front wait — we just hit the API and
- *  let its response (`in_progress`, ready, or 4xx) drive what happens next. */
-async function downloadEachMedia(rows, requestId, token) {
-  log(`Fetching per-media downloads (request ID ${requestId}, ${rows.length} item(s), concurrency ${FETCH_CONCURRENCY})…`);
-
-  let pendingRows = [...rows];
-  const succeeded = [];
-  const failed = [];
   const startMs = Date.now();
   let attempt = 0;
   let backoffIdx = 0;
 
-  while (pendingRows.length > 0) {
+  while (Date.now() - startMs < POLL_MAX_MS) {
     attempt++;
-    const elapsed = Date.now() - startMs;
 
     if (attempt > 1) {
-      if (elapsed >= POLL_MAX_MS) {
-        log(
-          `Reached ${(POLL_MAX_MS / 60000).toFixed(0)}-minute polling cap. ` +
-          `${pendingRows.length} item(s) still pending — click "Re-fetch downloads" to retry later.`,
-          "warn"
-        );
-        break;
-      }
       const wait = POLL_INTERVALS_MS[Math.min(backoffIdx, POLL_INTERVALS_MS.length - 1)];
-      log(
-        `Cycle ${attempt}: ${pendingRows.length} pending. Waiting ${(wait / 1000).toFixed(0)}s ` +
-        `before next check (elapsed ${(elapsed / 1000).toFixed(0)}s)…`
-      );
+      const elapsed = Date.now() - startMs;
+      log(`${prefix}   …still preparing (elapsed ${(elapsed / 1000).toFixed(0)}s). Waiting ${(wait / 1000).toFixed(0)}s.`);
       await new Promise((r) => setTimeout(r, wait));
     }
 
-    const before = pendingRows.length;
-
-    const results = await runWithConcurrency(pendingRows, FETCH_CONCURRENCY, async (row) => {
-      try {
-        return {
-          row,
-          result: await fetchPerMediaDownload(row, requestId, token, { quiet: attempt > 1 }),
-        };
-      } catch (e) {
-        return { row, result: RESULT_FAILED, error: e };
-      }
-    });
-
-    const stillPending = [];
-    for (const r of results) {
-      if (!r) continue;
-      if (r.error) {
-        const label = r.row.vin ? `${r.row.mediaId} (VIN ${r.row.vin})` : r.row.mediaId;
-        log(`  ✗ ${label}: ${r.error.message}`, "err");
-        failed.push(r.row);
-      } else if (r.result === RESULT_DOWNLOADED) {
-        succeeded.push(r.row);
-      } else if (r.result === RESULT_FAILED) {
-        failed.push(r.row);
-      } else {
-        stillPending.push(r.row);
-      }
+    let result;
+    try {
+      result = await fetchPerMediaDownload(row, requestId, token, { quiet: attempt > 1 });
+    } catch (e) {
+      log(`${prefix}   ✗ ${label}: ${e.message}`, "err");
+      return false;
     }
 
-    pendingRows = stillPending;
+    if (result === RESULT_DOWNLOADED) {
+      const totalSec = ((Date.now() - startMs) / 1000).toFixed(1);
+      log(`${prefix}   ✓ ${label}: triggered after ${totalSec}s.`, "ok");
+      return true;
+    }
+    if (result === RESULT_FAILED) {
+      log(`${prefix}   ✗ ${label}: hard failure — see response above.`, "err");
+      return false;
+    }
+    backoffIdx++;
+  }
 
-    if (attempt > 1) {
-      const just = before - pendingRows.length;
-      if (just > 0) {
-        log(`  → ${just} new download(s) this cycle. ${pendingRows.length} still pending.`, "ok");
-        backoffIdx = 0; // got progress — reset back-off
-      } else {
-        log(`  …still ${pendingRows.length} pending (no change this cycle).`, "warn");
-        backoffIdx++;
-      }
+  log(`${prefix}   ⏱  ${label}: ${(POLL_MAX_MS / 60000).toFixed(0)}-min polling cap hit, still pending.`, "warn");
+  return false;
+}
+
+/** Process every VIN strictly sequentially: poll until that VIN's ZIP is ready,
+ *  trigger its download, wait for the browser to start saving, then move to
+ *  the next. This way the per-VIN images (sequenced inside each ZIP via
+ *  `isSequence: true`) also arrive on disk in VIN order, one at a time.
+ */
+async function downloadEachMedia(rows, requestId, token) {
+  if (!rows.length) return;
+
+  log(
+    `Sequential per-VIN download for request ID ${requestId} ` +
+    `(${rows.length} VIN${rows.length === 1 ? "" : "s"} — one at a time, images in sequence inside each ZIP).`
+  );
+
+  const startMs = Date.now();
+  let succeeded = 0, failed = 0;
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const label = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
+    log(`[${i + 1}/${rows.length}] Starting ${label}…`);
+
+    const ok = await pollAndDownloadOne(row, requestId, token, i, rows.length);
+    if (ok) succeeded++; else failed++;
+
+    // Pause after a successful trigger so the browser starts saving the ZIP
+    // before we open the next tab. Skip this delay on the very last item.
+    if (ok && i < rows.length - 1) {
+      log(`  Waiting ${(SEQUENTIAL_DOWNLOAD_DELAY_MS / 1000).toFixed(1)}s before the next VIN…`);
+      await new Promise((r) => setTimeout(r, SEQUENTIAL_DOWNLOAD_DELAY_MS));
     }
   }
 
   const totalSec = ((Date.now() - startMs) / 1000).toFixed(1);
   log(
-    `Per-media downloads done in ${totalSec}s. ` +
-    `Success=${succeeded.length}  Failure=${failed.length}  Pending=${pendingRows.length}`,
-    failed.length || pendingRows.length ? "warn" : "ok"
+    `Sequential downloads done in ${totalSec}s. Success=${succeeded}  Failure=${failed}`,
+    failed ? "warn" : "ok"
   );
 }
 
