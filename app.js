@@ -193,12 +193,26 @@ function buildPayload(mediaIds) {
   };
 }
 
+function newRequestId() {
+  // crypto.randomUUID is available in all modern browsers (Chrome 92+, Safari 15.4+, Firefox 95+).
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  // Fallback for older browsers.
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+
 function buildHeaders(token) {
   // Browsers won't let JS set Origin, Referer, or Sec-* headers — they're populated automatically.
+  // X-Request-Id is required by Spyne's API; we generate a fresh UUID per call.
   return {
     accept: "application/json, text/plain, */*",
     authorization: token.startsWith("Bearer ") ? token : `Bearer ${token}`,
     "content-type": "application/json",
+    "x-request-id": newRequestId(),
   };
 }
 
