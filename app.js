@@ -9,14 +9,20 @@ const PER_MEDIA_URL = (mediaId, requestId) =>
   `https://api.spyne.ai/medias/${encodeURIComponent(mediaId)}/download/${encodeURIComponent(requestId)}`;
 const STORAGE_KEY = "spyne-bulk-downloader/v1";
 
-// Delay between per-media GETs so we don't hammer the server.
-const PER_MEDIA_DELAY_MS = 600;
-// Initial wait after POST before starting per-media GETs (lets the bulk job kick off).
-const POST_TO_GET_DELAY_MS = 1500;
+// How many per-media GETs run in parallel. 4 is a good middle ground for
+// 20–30 VIN batches without hammering the API.
+const FETCH_CONCURRENCY = 4;
+
+// Wait between successive polling cycles when items are still pending.
+// Starts short and backs off if Spyne is slow.
+const POLL_INTERVALS_MS = [3_000, 5_000, 10_000, 15_000, 30_000];
+
+// Hard ceiling on total polling time so the UI doesn't loop forever.
+const POLL_MAX_MS = 15 * 60 * 1000; // 15 minutes
 
 // ---------- helpers ----------
 
-const $ = (id) => document.getElementById(id); 
+const $ = (id) => document.getElementById(id);
 
 const els = {
   authToken: $("auth-token"),
@@ -245,8 +251,14 @@ function saveBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
 }
 
-/** Hit the per-media GET endpoint and turn the response into a download. */
-async function fetchPerMediaDownload(row, requestId, token) {
+/** Result codes for fetchPerMediaDownload(). */
+const RESULT_DOWNLOADED = "downloaded";   // file saved or URL opened — done
+const RESULT_PENDING = "pending";         // still preparing — retry later
+const RESULT_FAILED = "failed";           // hard failure — don't retry
+
+/** Hit the per-media GET endpoint and turn the response into a download.
+ *  Returns one of RESULT_DOWNLOADED / RESULT_PENDING / RESULT_FAILED. */
+async function fetchPerMediaDownload(row, requestId, token, { quiet = false } = {}) {
   const url = PER_MEDIA_URL(row.mediaId, requestId);
   const label = row.vin ? `${row.mediaId}  (VIN ${row.vin})` : row.mediaId;
 
@@ -264,8 +276,13 @@ async function fetchPerMediaDownload(row, requestId, token) {
 
   if (!res.ok) {
     const txt = await res.text().catch(() => res.statusText);
+    // 404 right after POST often means "not yet available"; treat as pending.
+    if (res.status === 404 || res.status === 425 || /not.?ready|in[\s_-]?progress/i.test(txt)) {
+      if (!quiet) log(`  ⋯ ${label}: still preparing (HTTP ${res.status}). Will retry.`, "warn");
+      return RESULT_PENDING;
+    }
     log(`  ✗ ${label}: HTTP ${res.status} — ${txt.slice(0, 240)}`, "err");
-    return false;
+    return RESULT_FAILED;
   }
 
   if (ctype.includes("application/json")) {
@@ -282,14 +299,14 @@ async function fetchPerMediaDownload(row, requestId, token) {
     if (typeof downloadUrl === "string" && downloadUrl.startsWith("http")) {
       window.open(downloadUrl, "_blank", "noopener");
       log(`  ✓ ${label}: download URL opened`, "ok");
-      return true;
+      return RESULT_DOWNLOADED;
     }
     if (["pending", "in_progress", "yet_to_start", "queued", "processing"].includes(status)) {
-      log(`  ⋯ ${label}: still preparing (${status}). Try the "Re-fetch downloads" button in a minute.`, "warn");
-      return false;
+      if (!quiet) log(`  ⋯ ${label}: still preparing (${status}). Will retry.`, "warn");
+      return RESULT_PENDING;
     }
     log(`  ? ${label}: ${JSON.stringify(json).slice(0, 240)}`, "warn");
-    return false;
+    return RESULT_FAILED;
   }
 
   // Anything non-JSON we treat as the file itself.
@@ -301,26 +318,111 @@ async function fetchPerMediaDownload(row, requestId, token) {
     `${row.vin || row.mediaId}-${Date.now()}.${ctype.includes("zip") ? "zip" : "bin"}`;
   saveBlob(blob, fname);
   log(`  ✓ ${label}: saved ${fname} (${(blob.size / 1024 / 1024).toFixed(2)} MB)`, "ok");
-  return true;
+  return RESULT_DOWNLOADED;
 }
 
-/** Iterate through each mediaId and hit the per-media download endpoint. */
-async function downloadEachMedia(rows, requestId, token) {
-  log(`Fetching per-media downloads (request ID ${requestId})…`);
-  let ok = 0, fail = 0;
-  for (const row of rows) {
-    try {
-      const success = await fetchPerMediaDownload(row, requestId, token);
-      success ? ok++ : fail++;
-    } catch (e) {
-      const label = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
-      log(`  ✗ ${label}: ${e.message}`, "err");
-      fail++;
+/** Run an async fn over `items` with at most `concurrency` in flight at once.
+ *  Returns the results in original order. */
+async function runWithConcurrency(items, concurrency, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      try {
+        results[i] = await fn(items[i], i);
+      } catch (e) {
+        results[i] = { __error: e };
+      }
     }
-    // Small delay so we don't trigger rate-limiting / popup-blocker collisions.
-    await new Promise((r) => setTimeout(r, PER_MEDIA_DELAY_MS));
   }
-  log(`Per-media downloads done. Success=${ok}  Failure=${fail}`, fail ? "warn" : "ok");
+  await Promise.all(Array(Math.min(concurrency, items.length)).fill(0).map(worker));
+  return results;
+}
+
+/** Drive per-media downloads for all rows, polling pending ones until done or
+ *  POLL_MAX_MS elapses. No arbitrary up-front wait — we just hit the API and
+ *  let its response (`in_progress`, ready, or 4xx) drive what happens next. */
+async function downloadEachMedia(rows, requestId, token) {
+  log(`Fetching per-media downloads (request ID ${requestId}, ${rows.length} item(s), concurrency ${FETCH_CONCURRENCY})…`);
+
+  let pendingRows = [...rows];
+  const succeeded = [];
+  const failed = [];
+  const startMs = Date.now();
+  let attempt = 0;
+  let backoffIdx = 0;
+
+  while (pendingRows.length > 0) {
+    attempt++;
+    const elapsed = Date.now() - startMs;
+
+    if (attempt > 1) {
+      if (elapsed >= POLL_MAX_MS) {
+        log(
+          `Reached ${(POLL_MAX_MS / 60000).toFixed(0)}-minute polling cap. ` +
+          `${pendingRows.length} item(s) still pending — click "Re-fetch downloads" to retry later.`,
+          "warn"
+        );
+        break;
+      }
+      const wait = POLL_INTERVALS_MS[Math.min(backoffIdx, POLL_INTERVALS_MS.length - 1)];
+      log(
+        `Cycle ${attempt}: ${pendingRows.length} pending. Waiting ${(wait / 1000).toFixed(0)}s ` +
+        `before next check (elapsed ${(elapsed / 1000).toFixed(0)}s)…`
+      );
+      await new Promise((r) => setTimeout(r, wait));
+    }
+
+    const before = pendingRows.length;
+
+    const results = await runWithConcurrency(pendingRows, FETCH_CONCURRENCY, async (row) => {
+      try {
+        return {
+          row,
+          result: await fetchPerMediaDownload(row, requestId, token, { quiet: attempt > 1 }),
+        };
+      } catch (e) {
+        return { row, result: RESULT_FAILED, error: e };
+      }
+    });
+
+    const stillPending = [];
+    for (const r of results) {
+      if (!r) continue;
+      if (r.error) {
+        const label = r.row.vin ? `${r.row.mediaId} (VIN ${r.row.vin})` : r.row.mediaId;
+        log(`  ✗ ${label}: ${r.error.message}`, "err");
+        failed.push(r.row);
+      } else if (r.result === RESULT_DOWNLOADED) {
+        succeeded.push(r.row);
+      } else if (r.result === RESULT_FAILED) {
+        failed.push(r.row);
+      } else {
+        stillPending.push(r.row);
+      }
+    }
+
+    pendingRows = stillPending;
+
+    if (attempt > 1) {
+      const just = before - pendingRows.length;
+      if (just > 0) {
+        log(`  → ${just} new download(s) this cycle. ${pendingRows.length} still pending.`, "ok");
+        backoffIdx = 0; // got progress — reset back-off
+      } else {
+        log(`  …still ${pendingRows.length} pending (no change this cycle).`, "warn");
+        backoffIdx++;
+      }
+    }
+  }
+
+  const totalSec = ((Date.now() - startMs) / 1000).toFixed(1);
+  log(
+    `Per-media downloads done in ${totalSec}s. ` +
+    `Success=${succeeded.length}  Failure=${failed.length}  Pending=${pendingRows.length}`,
+    failed.length || pendingRows.length ? "warn" : "ok"
+  );
 }
 
 // Set after a successful POST so the user can re-fetch downloads later
@@ -370,8 +472,7 @@ async function handleResponse(res, token) {
         lastRequestId = requestId;
         lastRows = parsedRows.slice();
         els.refetchBtn.hidden = false;
-        log(`Waiting ${POST_TO_GET_DELAY_MS} ms, then fetching per-media downloads…`);
-        await new Promise((r) => setTimeout(r, POST_TO_GET_DELAY_MS));
+        // No arbitrary up-front delay — drive everything off the GET response status.
         await downloadEachMedia(parsedRows, requestId, token);
       } else {
         log(
