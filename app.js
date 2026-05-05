@@ -5,7 +5,14 @@
  */
 
 const API_URL = "https://api.spyne.ai/medias/bulk-download";
+const PER_MEDIA_URL = (mediaId, requestId) =>
+  `https://api.spyne.ai/medias/${encodeURIComponent(mediaId)}/download/${encodeURIComponent(requestId)}`;
 const STORAGE_KEY = "spyne-bulk-downloader/v1";
+
+// Delay between per-media GETs so we don't hammer the server.
+const PER_MEDIA_DELAY_MS = 600;
+// Initial wait after POST before starting per-media GETs (lets the bulk job kick off).
+const POST_TO_GET_DELAY_MS = 1500;
 
 // ---------- helpers ----------
 
@@ -24,6 +31,7 @@ const els = {
   isSequence: $("is-sequence"),
   downloadProduct: $("download-product"),
   downloadBtn: $("download-btn"),
+  refetchBtn: $("refetch-btn"),
   clearCredsBtn: $("clear-creds-btn"),
   outputCard: $("output-card"),
   output: $("output"),
@@ -226,8 +234,102 @@ async function callBulkDownload(payload, token) {
   return res;
 }
 
+/** Save a Blob to disk via a hidden <a download>. */
+function saveBlob(blob, filename) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
+}
+
+/** Hit the per-media GET endpoint and turn the response into a download. */
+async function fetchPerMediaDownload(row, requestId, token) {
+  const url = PER_MEDIA_URL(row.mediaId, requestId);
+  const label = row.vin ? `${row.mediaId}  (VIN ${row.vin})` : row.mediaId;
+
+  const res = await fetch(url, {
+    method: "GET",
+    headers: {
+      accept: "application/json, text/plain, */*",
+      authorization: token.startsWith("Bearer ") ? token : `Bearer ${token}`,
+      "x-request-id": newRequestId(),
+    },
+    mode: "cors",
+  });
+
+  const ctype = (res.headers.get("content-type") || "").toLowerCase();
+
+  if (!res.ok) {
+    const txt = await res.text().catch(() => res.statusText);
+    log(`  ✗ ${label}: HTTP ${res.status} — ${txt.slice(0, 240)}`, "err");
+    return false;
+  }
+
+  if (ctype.includes("application/json")) {
+    const json = await res.json().catch(() => null);
+    const downloadUrl =
+      json?.data?.downloadUrl ||
+      json?.data?.url ||
+      json?.data?.signedUrl ||
+      json?.downloadUrl ||
+      json?.url ||
+      json?.signedUrl;
+    const status = (json?.data?.status || json?.status || "").toLowerCase();
+
+    if (typeof downloadUrl === "string" && downloadUrl.startsWith("http")) {
+      window.open(downloadUrl, "_blank", "noopener");
+      log(`  ✓ ${label}: download URL opened`, "ok");
+      return true;
+    }
+    if (["pending", "in_progress", "yet_to_start", "queued", "processing"].includes(status)) {
+      log(`  ⋯ ${label}: still preparing (${status}). Try the "Re-fetch downloads" button in a minute.`, "warn");
+      return false;
+    }
+    log(`  ? ${label}: ${JSON.stringify(json).slice(0, 240)}`, "warn");
+    return false;
+  }
+
+  // Anything non-JSON we treat as the file itself.
+  const blob = await res.blob();
+  const cd = res.headers.get("content-disposition") || "";
+  const fnameMatch = cd.match(/filename="?([^"]+)"?/i);
+  const fname =
+    fnameMatch?.[1] ||
+    `${row.vin || row.mediaId}-${Date.now()}.${ctype.includes("zip") ? "zip" : "bin"}`;
+  saveBlob(blob, fname);
+  log(`  ✓ ${label}: saved ${fname} (${(blob.size / 1024 / 1024).toFixed(2)} MB)`, "ok");
+  return true;
+}
+
+/** Iterate through each mediaId and hit the per-media download endpoint. */
+async function downloadEachMedia(rows, requestId, token) {
+  log(`Fetching per-media downloads (request ID ${requestId})…`);
+  let ok = 0, fail = 0;
+  for (const row of rows) {
+    try {
+      const success = await fetchPerMediaDownload(row, requestId, token);
+      success ? ok++ : fail++;
+    } catch (e) {
+      const label = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
+      log(`  ✗ ${label}: ${e.message}`, "err");
+      fail++;
+    }
+    // Small delay so we don't trigger rate-limiting / popup-blocker collisions.
+    await new Promise((r) => setTimeout(r, PER_MEDIA_DELAY_MS));
+  }
+  log(`Per-media downloads done. Success=${ok}  Failure=${fail}`, fail ? "warn" : "ok");
+}
+
+// Set after a successful POST so the user can re-fetch downloads later
+// (e.g., once the bulk job finishes processing) without re-submitting.
+let lastRequestId = null;
+let lastRows = [];
+
 /** Try to make a download happen from whatever shape the API responds with. */
-async function handleResponse(res) {
+async function handleResponse(res, token) {
   const ctype = (res.headers.get("content-type") || "").toLowerCase();
 
   if (ctype.includes("application/json")) {
@@ -235,9 +337,8 @@ async function handleResponse(res) {
     if (!res.ok) {
       throw new Error(`HTTP ${res.status} — ${JSON.stringify(json) || res.statusText}`);
     }
-    log(`Server response: ${JSON.stringify(json)}`, "ok");
 
-    // Common patterns for download URLs in JSON responses.
+    // 1) Inline download URL?
     const url =
       json?.downloadUrl ||
       json?.download_url ||
@@ -247,22 +348,44 @@ async function handleResponse(res) {
       json?.signedUrl;
     if (typeof url === "string" && url.startsWith("http")) {
       log(`Triggering download: ${url}`, "ok");
-      // Open in a new tab so the browser can handle the binary.
       window.open(url, "_blank", "noopener");
       return;
     }
 
-    if (json?.jobId || json?.requestId) {
-      log(
-        "API accepted the request asynchronously. Spyne typically emails the ZIP link " +
-        "when ready, or you can refresh the inventory page to see it appear in the " +
-        "downloads notification.",
-        "ok"
-      );
+    // 2) Async accepted — extract requestId and trigger per-media GETs.
+    const requestId =
+      json?.data?.requestId ||
+      json?.requestId ||
+      json?.jobId ||
+      json?.data?.jobId;
+    const acceptedStatuses = ["in_progress", "yet_to_start", "queued", "pending", "processing"];
+    const status = (json?.data?.status || json?.status || "").toLowerCase();
+
+    if (requestId || acceptedStatuses.includes(status) ||
+        (typeof json?.message === "string" && /accepted|in[\s_-]?progress/i.test(json.message))) {
+      log(`Spyne accepted the request. ${json?.message || ""}`.trim(), "ok");
+      if (requestId) log(`  Request ID: ${requestId}`, "ok");
+
+      if (requestId) {
+        lastRequestId = requestId;
+        lastRows = parsedRows.slice();
+        els.refetchBtn.hidden = false;
+        log(`Waiting ${POST_TO_GET_DELAY_MS} ms, then fetching per-media downloads…`);
+        await new Promise((r) => setTimeout(r, POST_TO_GET_DELAY_MS));
+        await downloadEachMedia(parsedRows, requestId, token);
+      } else {
+        log(
+          "Server didn't return a request ID, so per-media GETs aren't possible. " +
+          "Spyne will deliver the ZIP via in-app notification or email when ready.",
+          "warn"
+        );
+      }
       return;
     }
 
-    log("Request succeeded but no download URL was found in the response.", "warn");
+    // 3) Truly nothing actionable — dump the raw response.
+    log(`Server response: ${JSON.stringify(json)}`, "warn");
+    log("Request succeeded but the response shape isn't recognised. Share this with the developer to extend the parser.", "warn");
     return;
   }
 
@@ -311,7 +434,7 @@ async function onDownloadClick() {
   try {
     const payload = buildPayload(parsedRows.map((r) => r.mediaId));
     const res = await callBulkDownload(payload, token);
-    await handleResponse(res);
+    await handleResponse(res, token);
   } catch (e) {
     if (e.message?.includes("Failed to fetch") || e.name === "TypeError") {
       log(
@@ -330,6 +453,22 @@ async function onDownloadClick() {
 
 // ---------- wire up ----------
 
+async function onRefetchClick() {
+  if (!lastRequestId || !lastRows.length) {
+    log("No previous request to re-fetch. Click Download first.", "warn");
+    return;
+  }
+  const token = els.authToken.value.trim();
+  if (!token) return log("Authorization token is required.", "err");
+  els.refetchBtn.disabled = true;
+  try {
+    log(`Re-fetching downloads for request ID ${lastRequestId}…`);
+    await downloadEachMedia(lastRows, lastRequestId, token);
+  } finally {
+    els.refetchBtn.disabled = false;
+  }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   loadCreds();
   els.csvFile.addEventListener("change", (e) => {
@@ -337,5 +476,6 @@ document.addEventListener("DOMContentLoaded", () => {
     if (f) loadCSVFile(f);
   });
   els.downloadBtn.addEventListener("click", onDownloadClick);
+  if (els.refetchBtn) els.refetchBtn.addEventListener("click", onRefetchClick);
   els.clearCredsBtn.addEventListener("click", clearCreds);
 });
