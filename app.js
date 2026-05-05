@@ -4,9 +4,15 @@
  * needs to deploy the optional proxy described in README.md.
  */
 
-const API_URL = "https://api.spyne.ai/medias/bulk-download";
+// Per-VIN POST endpoint: POST /medias/{mediaId}/download with userData + downloadRequestData.
+// The body does NOT include mediaIds — the mediaId is in the URL path.
+const PER_VIN_POST_URL = (mediaId) =>
+  `https://api.spyne.ai/medias/${encodeURIComponent(mediaId)}/download`;
+
+// Status / direct-download GET for a previously-issued request.
 const PER_MEDIA_URL = (mediaId, requestId) =>
   `https://api.spyne.ai/medias/${encodeURIComponent(mediaId)}/download/${encodeURIComponent(requestId)}`;
+
 const STORAGE_KEY = "spyne-bulk-downloader/v1";
 
 // Wait between successive polling cycles while items are still pending.
@@ -191,7 +197,8 @@ function log(msg, kind = "info") {
 
 // ---------- API call ----------
 
-function buildPayload(mediaIds) {
+function buildPayload() {
+  // Per-VIN POST does not include mediaIds — the mediaId is in the URL path.
   return {
     userData: {
       enterpriseId: els.enterpriseId.value.trim(),
@@ -204,7 +211,6 @@ function buildPayload(mediaIds) {
       isSequence: els.isSequence.checked,
       downloadProduct: [els.downloadProduct.value],
     },
-    mediaIds,
   };
 }
 
@@ -231,14 +237,38 @@ function buildHeaders(token) {
   };
 }
 
-async function callBulkDownload(payload, token) {
-  const res = await fetch(API_URL, {
+async function callPerVinPost(mediaId, payload, token) {
+  const res = await fetch(PER_VIN_POST_URL(mediaId), {
     method: "POST",
     headers: buildHeaders(token),
     body: JSON.stringify(payload),
     mode: "cors",
   });
   return res;
+}
+
+/** Try to find a usable download URL anywhere in the API response. */
+function extractDownloadUrl(json, preferredProduct) {
+  const products = json?.data?.products || json?.products;
+  if (products && typeof products === "object") {
+    const orderedKeys = preferredProduct && products[preferredProduct]
+      ? [preferredProduct, ...Object.keys(products).filter((k) => k !== preferredProduct)]
+      : Object.keys(products);
+    for (const key of orderedKeys) {
+      const p = products[key] || {};
+      const purl = p.url || p.downloadUrl || p.signedUrl;
+      if (typeof purl === "string" && purl.startsWith("http")) return purl;
+    }
+  }
+  return (
+    json?.data?.downloadUrl ||
+    json?.data?.url ||
+    json?.data?.signedUrl ||
+    json?.downloadUrl ||
+    json?.url ||
+    json?.signedUrl ||
+    null
+  );
 }
 
 /** Save a Blob to disk via a hidden <a download>. */
@@ -541,7 +571,7 @@ async function onDownloadClick() {
 
   log(
     `Will process ${parsedRows.length} VIN${parsedRows.length === 1 ? "" : "s"} ` +
-    `sequentially, one POST per VIN (one ZIP per VIN, with images sequenced inside).`
+    `sequentially via POST /medias/{mediaId}/download (one ZIP per VIN).`
   );
 
   els.downloadBtn.disabled = true;
@@ -553,40 +583,46 @@ async function onDownloadClick() {
     for (let i = 0; i < parsedRows.length; i++) {
       const row = parsedRows[i];
       const label = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
-      log(`[${i + 1}/${parsedRows.length}] Submitting ${label}…`);
+      const tag = `[${i + 1}/${parsedRows.length}]`;
+      log(`${tag} POST /medias/${row.mediaId}/download …`);
 
       try {
-        // POST with just this single mediaId so Spyne creates a per-VIN bulk job.
-        const payload = buildPayload([row.mediaId]);
-        const postRes = await callBulkDownload(payload, token);
+        const payload = buildPayload();
+        const postRes = await callPerVinPost(row.mediaId, payload, token);
 
         if (!postRes.ok) {
           const text = await postRes.text().catch(() => postRes.statusText);
-          log(`[${i + 1}/${parsedRows.length}]   ✗ POST HTTP ${postRes.status} — ${text.slice(0, 220)}`, "err");
+          log(`${tag}   ✗ POST HTTP ${postRes.status} — ${text.slice(0, 240)}`, "err");
           failed++;
-          continue;
+        } else {
+          const json = await postRes.json().catch(() => null);
+
+          // Case A: POST is synchronous and already returns a download URL.
+          const directUrl = extractDownloadUrl(json, els.downloadProduct.value);
+          if (typeof directUrl === "string" && directUrl.startsWith("http")) {
+            window.open(directUrl, "_blank", "noopener");
+            log(`${tag}   ✓ ${label}: download URL opened (synchronous).`, "ok");
+            succeeded++;
+          } else {
+            // Case B: POST is async — polling required via the GET endpoint.
+            const requestId =
+              json?.data?.requestId || json?.requestId || json?.jobId || json?.data?.jobId;
+            if (!requestId) {
+              log(`${tag}   ✗ ${label}: POST returned neither URL nor requestId. Body: ${JSON.stringify(json).slice(0, 240)}`, "err");
+              failed++;
+            } else {
+              lastRequestIdsByMedia.set(row.mediaId, requestId);
+              log(`${tag}   POST accepted (requestId ${requestId}). Polling status…`);
+              const ok = await pollAndDownloadOne(row, requestId, token, i, parsedRows.length);
+              if (ok) succeeded++; else failed++;
+            }
+          }
         }
-
-        const json = await postRes.json().catch(() => null);
-        const requestId =
-          json?.data?.requestId || json?.requestId || json?.jobId || json?.data?.jobId;
-
-        if (!requestId) {
-          log(`[${i + 1}/${parsedRows.length}]   ✗ POST returned no requestId: ${JSON.stringify(json).slice(0, 220)}`, "err");
-          failed++;
-          continue;
-        }
-
-        lastRequestIdsByMedia.set(row.mediaId, requestId);
-        log(`[${i + 1}/${parsedRows.length}]   POST OK — requestId ${requestId}. Polling…`);
-
-        const ok = await pollAndDownloadOne(row, requestId, token, i, parsedRows.length);
-        if (ok) succeeded++; else failed++;
       } catch (e) {
         if (e.message?.includes("Failed to fetch") || e.name === "TypeError") {
-          log(`[${i + 1}/${parsedRows.length}]   ✗ Network/CORS error. See README → CORS proxy setup.`, "err");
+          log(`${tag}   ✗ Network/CORS error. See README → CORS proxy setup.`, "err");
         } else {
-          log(`[${i + 1}/${parsedRows.length}]   ✗ ${e.message}`, "err");
+          log(`${tag}   ✗ ${e.message}`, "err");
         }
         failed++;
       }
