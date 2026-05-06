@@ -13,7 +13,7 @@
       <h1>Spyne Bulk Media Downloader</h1>
       <p class="subtitle">
         Upload a CSV with media IDs and credentials, paste your auth token, hit Download.
-        All VINs are bundled into one ZIP. Calls <code>api.spyne.ai/medias/bulk-download</code> directly from your browser.
+        All VINs are bundled into one master ZIP or saved to a folder you choose.
       </p>
     </header>
 
@@ -21,11 +21,10 @@
       <h2>1. Authorization token</h2>
       <p class="hint">
         Open <a href="https://console.spyne.ai" target="_blank" rel="noopener">console.spyne.ai</a>,
-        log in, then open DevTools&nbsp;&rarr;&nbsp;Network tab. Trigger any action,
+        log in, then open DevTools &rarr; Network tab. Trigger any action,
         click any request, copy the <code>authorization</code> header value.
         Saved locally in your browser; expires every 5&ndash;6 days.
       </p>
-
       <label>
         <span>Authorization token <small class="muted">(without "Bearer ")</small></span>
         <textarea id="auth-token" rows="2" placeholder="eyJhbGciOi..."></textarea>
@@ -36,20 +35,68 @@
     <section class="card">
       <h2>2. Media IDs (CSV upload)</h2>
       <p class="hint">
-        CSV <strong>must</strong> include these columns (case-insensitive):
+        CSV <strong>must</strong> include (case-insensitive):
         <code>Media ID</code>, <code>Enterprise ID</code>, <code>Team ID</code>.<br/>
-        Optional columns: <code>User ID</code>, <code>VIN</code> / <code>Sku Name</code> for labels.<br/>
-        Each Media ID must be a real 24-character Spyne ObjectId (e.g.&nbsp;<code>69f53edf315b2a8070388552</code>).
-        Grab them from <code>console.spyne.ai</code> DevTools &rarr; Network tab.
+        Optional: <code>User ID</code>, <code>VIN</code> / <code>Sku Name</code> for labels.
       </p>
-
       <input type="file" id="csv-file" accept=".csv,text/csv" />
       <a href="sample.csv" download class="link">Download a sample CSV</a>
       <div id="csv-summary" class="muted"></div>
     </section>
 
     <section class="card">
-      <h2>3. Download options</h2>
+      <h2>3. Download destination</h2>
+      <p class="hint">
+        Choose <strong>one</strong> option. The proxy gives a single master ZIP (recommended).
+        The folder picker saves each VIN ZIP directly into a folder you choose — no proxy needed.
+        If neither is set, each VIN opens in a new browser tab.
+      </p>
+
+      <div class="dest-options">
+
+        <div class="dest-option" id="dest-proxy-block">
+          <div class="dest-label">
+            <span class="dest-badge">Option A</span>
+            <strong>Cloudflare Worker proxy</strong>
+            <small class="muted"> — all VINs bundled into one master ZIP download</small>
+          </div>
+          <label>
+            <span>Worker URL</span>
+            <input id="proxy-url" type="text"
+              placeholder="https://spyne-proxy.yourname.workers.dev"
+              autocomplete="off" />
+          </label>
+          <p class="hint" style="margin-top:8px">
+            Deploy <code>proxy/worker.js</code> to
+            <a href="https://workers.cloudflare.com" target="_blank" rel="noopener">Cloudflare Workers</a>
+            (free tier, ~2 min). Paste the deployed URL above.
+            See <a href="README.md">README</a> for step-by-step instructions.
+          </p>
+        </div>
+
+        <div class="dest-divider">— or —</div>
+
+        <div class="dest-option" id="dest-folder-block">
+          <div class="dest-label">
+            <span class="dest-badge">Option B</span>
+            <strong>Folder picker</strong>
+            <small class="muted"> — each VIN ZIP saved directly to a folder you choose</small>
+          </div>
+          <div class="actions" style="margin:10px 0 4px">
+            <button id="pick-folder-btn" class="ghost">Choose folder&hellip;</button>
+          </div>
+          <div id="folder-status" class="muted" style="font-size:13px"></div>
+          <p id="folder-unsupported" class="muted" style="font-size:13px; margin-top:6px" hidden>
+            &#9888; Your browser does not support the folder picker
+            (requires Chrome&nbsp;86+ or Edge&nbsp;86+).
+          </p>
+        </div>
+
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>4. Download options</h2>
       <div class="row">
         <label>
           <span>Download type</span>
@@ -59,7 +106,6 @@
             <option value="output">output</option>
           </select>
         </label>
-
         <label>
           <span>Format</span>
           <select id="format-type">
@@ -67,12 +113,10 @@
             <option value="folder">folder</option>
           </select>
         </label>
-
         <label class="checkbox">
           <input type="checkbox" id="is-sequence" checked />
           <span>Sequence (download sequentially)</span>
         </label>
-
         <label>
           <span>Product</span>
           <select id="download-product">
@@ -84,8 +128,9 @@
     </section>
 
     <section class="actions">
-      <button id="download-btn" class="primary">Download All as ZIP</button>
-      <button id="refetch-btn" class="ghost" hidden title="Retry per-media downloads using the most recent request ID">Re-fetch downloads</button>
+      <button id="download-btn" class="primary">Download</button>
+      <button id="refetch-btn" class="ghost" hidden
+        title="Retry per-media downloads using the most recent request ID">Re-fetch downloads</button>
       <button id="clear-creds-btn" class="ghost" title="Clear saved token">Clear saved token</button>
     </section>
 
@@ -96,13 +141,12 @@
 
     <footer>
       <small>
-        Calls api.spyne.ai directly. If you see a CORS error in the browser console,
-        Spyne's API only accepts requests from <code>console.spyne.ai</code>; you'll need a
-        small proxy (see <a href="README.md">README</a>) to relay the request.
+        Calls api.spyne.ai directly. If you see a CORS error, Spyne's API only accepts requests
+        from <code>console.spyne.ai</code> &mdash; deploy the proxy Worker (Option A above) or
+        see <a href="README.md">README</a>.
       </small>
     </footer>
   </main>
-
   <script src="app.js"></script>
 </body>
 </html>
