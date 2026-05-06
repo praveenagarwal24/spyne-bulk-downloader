@@ -37,6 +37,8 @@ const els = {
   enterpriseId: $("enterprise-id"),
   teamId: $("team-id"),
   userId: $("user-id"),
+  credsRow: $("creds-row"),
+  credsFromCsvMsg: $("creds-from-csv-msg"),
   csvFile: $("csv-file"),
   csvSummary: $("csv-summary"),
   downloadType: $("download-type"),
@@ -187,6 +189,13 @@ function loadCSVFile(file) {
         if (first.teamId && !els.teamId.value.trim()) els.teamId.value = first.teamId;
         if (first.userId && !els.userId.value.trim()) els.userId.value = first.userId;
       }
+      // Hide the form's credential fields if the CSV is supplying them on every row.
+      const csvHasFullCreds =
+        eidIdx >= 0 && tidIdx >= 0 &&
+        parsedRows.every((r) => r.enterpriseId && r.teamId);
+      if (els.credsRow) els.credsRow.hidden = !!csvHasFullCreds;
+      if (els.credsFromCsvMsg) els.credsFromCsvMsg.hidden = !csvHasFullCreds;
+
       const extras = [];
       if (vinIdx >= 0) extras.push("VIN labels");
       if (eidIdx >= 0 || tidIdx >= 0 || uidIdx >= 0) extras.push("per-row credentials");
