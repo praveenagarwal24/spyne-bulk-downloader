@@ -128,6 +128,9 @@ function parseCSV(text) {
 
 const MEDIA_ID_HEADERS = ["media id", "mediaid", "media_id", "mediaids", "media ids"];
 const VIN_HEADERS = ["vin", "sku name", "sku", "vin name"];
+const ENTERPRISE_ID_HEADERS = ["enterprise id", "enterpriseid", "enterprise_id", "enterprise"];
+const TEAM_ID_HEADERS = ["team id", "teamid", "team_id", "team"];
+const USER_ID_HEADERS = ["user id", "userid", "user_id", "user"];
 
 function findHeaderIndex(headers, candidates) {
   const norm = (s) => s.toLowerCase().trim();
@@ -150,6 +153,9 @@ function loadCSVFile(file) {
       const headers = rows[0];
       const mediaIdx = findHeaderIndex(headers, MEDIA_ID_HEADERS);
       const vinIdx = findHeaderIndex(headers, VIN_HEADERS);
+      const eidIdx = findHeaderIndex(headers, ENTERPRISE_ID_HEADERS);
+      const tidIdx = findHeaderIndex(headers, TEAM_ID_HEADERS);
+      const uidIdx = findHeaderIndex(headers, USER_ID_HEADERS);
       if (mediaIdx === -1) {
         log(
           `CSV is missing a media-ID column. Expected one of: ${MEDIA_ID_HEADERS.join(", ")}. ` +
@@ -168,11 +174,25 @@ function loadCSVFile(file) {
         parsedRows.push({
           mediaId: m,
           vin: vinIdx >= 0 ? (rows[i][vinIdx] || "").trim() : "",
+          enterpriseId: eidIdx >= 0 ? (rows[i][eidIdx] || "").trim() : "",
+          teamId: tidIdx >= 0 ? (rows[i][tidIdx] || "").trim() : "",
+          userId: uidIdx >= 0 ? (rows[i][uidIdx] || "").trim() : "",
         });
       }
+      // Auto-fill the credential form fields from the first row that supplies them,
+      // so users who put creds in the CSV don't also have to paste them above.
+      if (parsedRows.length) {
+        const first = parsedRows[0];
+        if (first.enterpriseId && !els.enterpriseId.value.trim()) els.enterpriseId.value = first.enterpriseId;
+        if (first.teamId && !els.teamId.value.trim()) els.teamId.value = first.teamId;
+        if (first.userId && !els.userId.value.trim()) els.userId.value = first.userId;
+      }
+      const extras = [];
+      if (vinIdx >= 0) extras.push("VIN labels");
+      if (eidIdx >= 0 || tidIdx >= 0 || uidIdx >= 0) extras.push("per-row credentials");
       els.csvSummary.textContent =
         `Loaded ${parsedRows.length} unique media ID${parsedRows.length === 1 ? "" : "s"} from ${file.name}` +
-        (vinIdx >= 0 ? " (with VIN labels)." : ".");
+        (extras.length ? ` (with ${extras.join(" and ")}).` : ".");
     } catch (e) {
       log(`Failed to parse CSV: ${e.message}`, "err");
       parsedRows = [];
@@ -197,14 +217,15 @@ function log(msg, kind = "info") {
 
 // ---------- API call ----------
 
-function buildPayload() {
+function buildPayload(row) {
   // Per-VIN POST does not include mediaIds — the mediaId is in the URL path.
+  // Each CSV row may override the form's credentials; otherwise we use the
+  // values typed into section 1.
+  const enterpriseId = (row?.enterpriseId || els.enterpriseId.value).trim();
+  const userId = (row?.userId || els.userId.value).trim();
+  const teamId = (row?.teamId || els.teamId.value).trim();
   return {
-    userData: {
-      enterpriseId: els.enterpriseId.value.trim(),
-      userId: els.userId.value.trim(),
-      teamId: els.teamId.value.trim(),
-    },
+    userData: { enterpriseId, userId, teamId },
     downloadRequestData: {
       downloadType: els.downloadType.value,
       formatType: els.formatType.value,
@@ -288,66 +309,25 @@ function safeFilename(name, fallback = "download") {
   return cleaned || fallback;
 }
 
-/** Prompt the user to pick a folder for this run. Returns the dir handle or
- *  null (and a reason) if the user cancelled or the browser doesn't support it.
+/** Try to fetch this VIN's ZIP and add it to the master ZIP under {VIN}.zip.
+ *  If the fetch fails (typically CORS on the S3 URL), fall back to opening the
+ *  URL in a new tab so the browser saves it to the default Downloads folder.
  */
-async function pickDownloadFolder() {
-  if (!DIR_PICKER_SUPPORTED) {
-    log(
-      "Your browser doesn't support choosing a download folder " +
-      "(needs Chrome/Edge). All ZIPs will go to your default Downloads folder.",
-      "warn"
-    );
-    return null;
-  }
-  try {
-    const handle = await window.showDirectoryPicker({
-      mode: "readwrite",
-      startIn: "downloads",
-    });
-    log(`All VINs will be saved into folder: ${handle.name}`, "ok");
-    return handle;
-  } catch (e) {
-    if (e.name === "AbortError") {
-      log("Folder picker cancelled — falling back to default Downloads folder.", "warn");
-    } else {
-      log(`Folder picker error: ${e.message}. Using default Downloads folder.`, "warn");
-    }
-    return null;
-  }
-}
-
-/** Fetch a (typically S3) URL and write the response into the user-picked
- *  folder under the supplied filename. Returns the bytes saved.
- *  May throw if the cross-origin fetch is blocked by CORS.
- */
-async function saveUrlToFolder(url, filename, dirHandle) {
-  const res = await fetch(url, { mode: "cors" });
-  if (!res.ok) throw new Error(`HTTP ${res.status} fetching file`);
-  const blob = await res.blob();
-  // If the response Content-Disposition has a real filename and the caller
-  // didn't insist on one, prefer Spyne's filename for consistency. We always
-  // honor the caller's filename when provided so the VIN naming wins.
-  const fileHandle = await dirHandle.getFileHandle(safeFilename(filename), { create: true });
-  const writable = await fileHandle.createWritable();
-  await writable.write(blob);
-  await writable.close();
-  return blob.size;
-}
-
-/** Either save a download URL into the picked folder, or fall back to opening
- *  the URL in a new tab so the browser handles it the default way. */
 async function deliverDownload(url, row, label) {
-  const filename = `${safeFilename(row.vin || row.mediaId)}.zip`;
-  if (downloadDirHandle) {
+  const entryName = `${safeFilename(row.vin || row.mediaId)}.zip`;
+  if (masterZip) {
     try {
-      const bytes = await saveUrlToFolder(url, filename, downloadDirHandle);
-      log(`  ✓ ${label}: saved ${filename} (${(bytes / 1024 / 1024).toFixed(2)} MB) to ${downloadDirHandle.name}/`, "ok");
+      const res = await fetch(url, { mode: "cors" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      masterZip.file(entryName, blob);
+      masterZipEntries++;
+      log(`  ✓ ${label}: added ${entryName} (${(blob.size / 1024 / 1024).toFixed(2)} MB) to master ZIP.`, "ok");
       return;
     } catch (e) {
       log(
-        `  Folder save failed for ${filename} (${e.message}). ` +
-        `Opening the URL in a new tab so the browser saves it to your default Downloads folder…`,
+        `  Could not fetch ${entryName} for the master ZIP (${e.message}). ` +
+        `Opening the URL directly so the browser saves it to your default Downloads folder…`,
         "warn"
       );
       // Fall through to window.open below.
@@ -556,10 +536,9 @@ async function downloadEachMedia(rows, requestId, token) {
 let lastRows = [];
 let lastRequestIdsByMedia = new Map(); // mediaId -> requestId
 
-// Folder the user picked at the start of this run (File System Access API).
-// All per-VIN ZIPs are saved into here as {VIN}.zip if available.
-let downloadDirHandle = null;
-const DIR_PICKER_SUPPORTED = typeof window !== "undefined" && "showDirectoryPicker" in window;
+// Master ZIP being built during the current run (one entry per VIN).
+let masterZip = null;
+let masterZipEntries = 0;
 
 /** Try to make a download happen from whatever shape the API responds with. */
 async function handleResponse(res, token) {
@@ -657,13 +636,21 @@ async function onDownloadClick() {
   lastRows = parsedRows.slice();
   lastRequestIdsByMedia = new Map();
 
-  // Ask for the destination folder up front, while we still have the click's
-  // "user activation" — showDirectoryPicker won't work later in async land.
-  downloadDirHandle = await pickDownloadFolder();
+  // Build a master ZIP if JSZip is available. As each VIN's ZIP comes back,
+  // we add it as an entry; at the end we generate one combined ZIP file and
+  // trigger a single download.
+  if (typeof JSZip === "function") {
+    masterZip = new JSZip();
+    masterZipEntries = 0;
+  } else {
+    masterZip = null;
+    log("JSZip didn't load (CDN blocked?). Falling back to one tab per VIN.", "warn");
+  }
 
   log(
     `Will process ${parsedRows.length} VIN${parsedRows.length === 1 ? "" : "s"} ` +
-    `sequentially via POST /medias/{mediaId}/download (one ZIP per VIN).`
+    `sequentially via POST /medias/{mediaId}/download` +
+    (masterZip ? ` and bundle them into one master ZIP.` : `.`)
   );
 
   els.downloadBtn.disabled = true;
@@ -679,7 +666,7 @@ async function onDownloadClick() {
       log(`${tag} POST /medias/${row.mediaId}/download …`);
 
       try {
-        const payload = buildPayload();
+        const payload = buildPayload(row);
         const postRes = await callPerVinPost(row.mediaId, payload, token);
 
         if (!postRes.ok) {
@@ -733,6 +720,27 @@ async function onDownloadClick() {
     `All VINs processed in ${totalSec}s. Success=${succeeded}  Failure=${failed}`,
     failed ? "warn" : "ok"
   );
+
+  // Finalize the master ZIP if any entries were collected.
+  if (masterZip && masterZipEntries > 0) {
+    log(`Building master ZIP with ${masterZipEntries} VIN${masterZipEntries === 1 ? "" : "s"}…`);
+    try {
+      const blob = await masterZip.generateAsync({ type: "blob", compression: "STORE" });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      saveBlob(blob, `spyne-downloads-${stamp}.zip`);
+      log(`Master ZIP saved (${(blob.size / 1024 / 1024).toFixed(2)} MB).`, "ok");
+    } catch (e) {
+      log(`Could not build master ZIP: ${e.message}`, "err");
+    }
+  } else if (masterZip && masterZipEntries === 0) {
+    log(
+      "No VINs were added to the master ZIP — every fetch fell back to a tab. " +
+      "If this happened due to CORS, you'll need a small Cloudflare Worker proxy (see README).",
+      "warn"
+    );
+  }
+  masterZip = null;
+  masterZipEntries = 0;
 }
 
 // ---------- wire up ----------
@@ -745,8 +753,13 @@ async function onRefetchClick() {
   const token = els.authToken.value.trim();
   if (!token) return log("Authorization token is required.", "err");
 
-  // Re-prompt for the folder so files land in a fresh location each run if desired.
-  downloadDirHandle = await pickDownloadFolder();
+  // Build a fresh master ZIP for this re-fetch run.
+  if (typeof JSZip === "function") {
+    masterZip = new JSZip();
+    masterZipEntries = 0;
+  } else {
+    masterZip = null;
+  }
 
   els.refetchBtn.disabled = true;
   const startMs = Date.now();
@@ -773,6 +786,19 @@ async function onRefetchClick() {
   }
   const totalSec = ((Date.now() - startMs) / 1000).toFixed(1);
   log(`Re-fetch done in ${totalSec}s. Success=${succeeded}  Failure=${failed}`, failed ? "warn" : "ok");
+
+  if (masterZip && masterZipEntries > 0) {
+    try {
+      const blob = await masterZip.generateAsync({ type: "blob", compression: "STORE" });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      saveBlob(blob, `spyne-downloads-${stamp}.zip`);
+      log(`Master ZIP saved with ${masterZipEntries} VIN(s) (${(blob.size / 1024 / 1024).toFixed(2)} MB).`, "ok");
+    } catch (e) {
+      log(`Could not build master ZIP: ${e.message}`, "err");
+    }
+  }
+  masterZip = null;
+  masterZipEntries = 0;
 }
 
 document.addEventListener("DOMContentLoaded", () => {
