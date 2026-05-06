@@ -282,6 +282,81 @@ function saveBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
 }
 
+/** Sanitize a string for use as a filename. */
+function safeFilename(name, fallback = "download") {
+  const cleaned = String(name || fallback).replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim();
+  return cleaned || fallback;
+}
+
+/** Prompt the user to pick a folder for this run. Returns the dir handle or
+ *  null (and a reason) if the user cancelled or the browser doesn't support it.
+ */
+async function pickDownloadFolder() {
+  if (!DIR_PICKER_SUPPORTED) {
+    log(
+      "Your browser doesn't support choosing a download folder " +
+      "(needs Chrome/Edge). All ZIPs will go to your default Downloads folder.",
+      "warn"
+    );
+    return null;
+  }
+  try {
+    const handle = await window.showDirectoryPicker({
+      mode: "readwrite",
+      startIn: "downloads",
+    });
+    log(`All VINs will be saved into folder: ${handle.name}`, "ok");
+    return handle;
+  } catch (e) {
+    if (e.name === "AbortError") {
+      log("Folder picker cancelled — falling back to default Downloads folder.", "warn");
+    } else {
+      log(`Folder picker error: ${e.message}. Using default Downloads folder.`, "warn");
+    }
+    return null;
+  }
+}
+
+/** Fetch a (typically S3) URL and write the response into the user-picked
+ *  folder under the supplied filename. Returns the bytes saved.
+ *  May throw if the cross-origin fetch is blocked by CORS.
+ */
+async function saveUrlToFolder(url, filename, dirHandle) {
+  const res = await fetch(url, { mode: "cors" });
+  if (!res.ok) throw new Error(`HTTP ${res.status} fetching file`);
+  const blob = await res.blob();
+  // If the response Content-Disposition has a real filename and the caller
+  // didn't insist on one, prefer Spyne's filename for consistency. We always
+  // honor the caller's filename when provided so the VIN naming wins.
+  const fileHandle = await dirHandle.getFileHandle(safeFilename(filename), { create: true });
+  const writable = await fileHandle.createWritable();
+  await writable.write(blob);
+  await writable.close();
+  return blob.size;
+}
+
+/** Either save a download URL into the picked folder, or fall back to opening
+ *  the URL in a new tab so the browser handles it the default way. */
+async function deliverDownload(url, row, label) {
+  const filename = `${safeFilename(row.vin || row.mediaId)}.zip`;
+  if (downloadDirHandle) {
+    try {
+      const bytes = await saveUrlToFolder(url, filename, downloadDirHandle);
+      log(`  ✓ ${label}: saved ${filename} (${(bytes / 1024 / 1024).toFixed(2)} MB) to ${downloadDirHandle.name}/`, "ok");
+      return;
+    } catch (e) {
+      log(
+        `  Folder save failed for ${filename} (${e.message}). ` +
+        `Opening the URL in a new tab so the browser saves it to your default Downloads folder…`,
+        "warn"
+      );
+      // Fall through to window.open below.
+    }
+  }
+  window.open(url, "_blank", "noopener");
+  log(`  ✓ ${label}: download URL opened in a new tab.`, "ok");
+}
+
 /** Result codes for fetchPerMediaDownload(). */
 const RESULT_DOWNLOADED = "downloaded";   // file saved or URL opened — done
 const RESULT_PENDING = "pending";         // still preparing — retry later
@@ -357,8 +432,7 @@ async function fetchPerMediaDownload(row, requestId, token, { quiet = false } = 
     }
 
     if (typeof downloadUrl === "string" && downloadUrl.startsWith("http")) {
-      window.open(downloadUrl, "_blank", "noopener");
-      log(`  ✓ ${label}: download URL opened`, "ok");
+      await deliverDownload(downloadUrl, row, label);
       return RESULT_DOWNLOADED;
     }
 
@@ -374,13 +448,22 @@ async function fetchPerMediaDownload(row, requestId, token, { quiet = false } = 
 
   // Anything non-JSON we treat as the file itself.
   const blob = await res.blob();
-  const cd = res.headers.get("content-disposition") || "";
-  const fnameMatch = cd.match(/filename="?([^"]+)"?/i);
-  const fname =
-    fnameMatch?.[1] ||
-    `${row.vin || row.mediaId}-${Date.now()}.${ctype.includes("zip") ? "zip" : "bin"}`;
+  const ext = ctype.includes("zip") ? "zip" : "bin";
+  const fname = `${safeFilename(row.vin || row.mediaId)}.${ext}`;
+  if (downloadDirHandle) {
+    try {
+      const fh = await downloadDirHandle.getFileHandle(fname, { create: true });
+      const w = await fh.createWritable();
+      await w.write(blob);
+      await w.close();
+      log(`  ✓ ${label}: saved ${fname} (${(blob.size / 1024 / 1024).toFixed(2)} MB) to ${downloadDirHandle.name}/`, "ok");
+      return RESULT_DOWNLOADED;
+    } catch (e) {
+      log(`  Folder save failed (${e.message}); using default Downloads folder.`, "warn");
+    }
+  }
   saveBlob(blob, fname);
-  log(`  ✓ ${label}: saved ${fname} (${(blob.size / 1024 / 1024).toFixed(2)} MB)`, "ok");
+  log(`  ✓ ${label}: saved ${fname} (${(blob.size / 1024 / 1024).toFixed(2)} MB) to default Downloads`, "ok");
   return RESULT_DOWNLOADED;
 }
 
@@ -472,6 +555,11 @@ async function downloadEachMedia(rows, requestId, token) {
 // (e.g., once the per-VIN jobs finish) without re-submitting.
 let lastRows = [];
 let lastRequestIdsByMedia = new Map(); // mediaId -> requestId
+
+// Folder the user picked at the start of this run (File System Access API).
+// All per-VIN ZIPs are saved into here as {VIN}.zip if available.
+let downloadDirHandle = null;
+const DIR_PICKER_SUPPORTED = typeof window !== "undefined" && "showDirectoryPicker" in window;
 
 /** Try to make a download happen from whatever shape the API responds with. */
 async function handleResponse(res, token) {
@@ -569,6 +657,10 @@ async function onDownloadClick() {
   lastRows = parsedRows.slice();
   lastRequestIdsByMedia = new Map();
 
+  // Ask for the destination folder up front, while we still have the click's
+  // "user activation" — showDirectoryPicker won't work later in async land.
+  downloadDirHandle = await pickDownloadFolder();
+
   log(
     `Will process ${parsedRows.length} VIN${parsedRows.length === 1 ? "" : "s"} ` +
     `sequentially via POST /medias/{mediaId}/download (one ZIP per VIN).`
@@ -600,8 +692,7 @@ async function onDownloadClick() {
           // Case A: POST is synchronous and already returns a download URL.
           const directUrl = extractDownloadUrl(json, els.downloadProduct.value);
           if (typeof directUrl === "string" && directUrl.startsWith("http")) {
-            window.open(directUrl, "_blank", "noopener");
-            log(`${tag}   ✓ ${label}: download URL opened (synchronous).`, "ok");
+            await deliverDownload(directUrl, row, label);
             succeeded++;
           } else {
             // Case B: POST is async — polling required via the GET endpoint.
@@ -653,6 +744,9 @@ async function onRefetchClick() {
   }
   const token = els.authToken.value.trim();
   if (!token) return log("Authorization token is required.", "err");
+
+  // Re-prompt for the folder so files land in a fresh location each run if desired.
+  downloadDirHandle = await pickDownloadFolder();
 
   els.refetchBtn.disabled = true;
   const startMs = Date.now();
