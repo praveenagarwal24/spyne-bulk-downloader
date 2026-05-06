@@ -1,6 +1,6 @@
 /* Spyne Bulk Media Downloader — front-end logic.
  * Calls https://api.spyne.ai/medias/bulk-download directly from the browser.
- * If Spyne's CORS rejects the call (origin must be console.spyne.ai), the user 
+ * If Spyne's CORS rejects the call (origin must be console.spyne.ai), the user
  * needs to deploy the optional proxy described in README.md.
  */
 
