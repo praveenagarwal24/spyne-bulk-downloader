@@ -1,11 +1,13 @@
 /* Spyne Bulk Media Downloader — front-end logic.
- * Calls https://api.spyne.ai/medias/bulk-download directly from the browser.
- * If Spyne's CORS rejects the call (origin must be console.spyne.ai), the user
- * needs to deploy the optional proxy described in README.md.
+ * Calls https://api.spyne.ai/medias/{mediaId}/download per VIN.
+ * Enterprise ID, Team ID, and User ID are read exclusively from the CSV.
+ * All VINs are collected into one master ZIP for a single download trigger.
+ *
+ * If Spyne's CORS rejects the call (origin must be console.spyne.ai), deploy
+ * the optional proxy described in README.md.
  */
 
-// Per-VIN POST endpoint: POST /medias/{mediaId}/download with userData + downloadRequestData.
-// The body does NOT include mediaIds — the mediaId is in the URL path.
+// Per-VIN POST endpoint: POST /medias/{mediaId}/download
 const PER_VIN_POST_URL = (mediaId) =>
   `https://api.spyne.ai/medias/${encodeURIComponent(mediaId)}/download`;
 
@@ -13,19 +15,14 @@ const PER_VIN_POST_URL = (mediaId) =>
 const PER_MEDIA_URL = (mediaId, requestId) =>
   `https://api.spyne.ai/medias/${encodeURIComponent(mediaId)}/download/${encodeURIComponent(requestId)}`;
 
-const STORAGE_KEY = "spyne-bulk-downloader/v1";
+const STORAGE_KEY = "spyne-bulk-downloader/v2";
 
-// Wait between successive polling cycles while items are still pending.
-// Starts short and backs off if Spyne stays "in_progress" for a while.
+// Polling back-off intervals (ms).
 const POLL_INTERVALS_MS = [3_000, 5_000, 10_000, 15_000, 30_000];
+const POLL_MAX_MS = 15 * 60 * 1000; // 15 minutes hard cap
 
-// Hard ceiling on total polling time so the UI doesn't loop forever.
-const POLL_MAX_MS = 15 * 60 * 1000; // 15 minutes
-
-// Delay after a successful download trigger before moving to the next VIN.
-// Gives the browser time to actually start saving the previous ZIP without
-// triggering popup-blocker collisions.
-const SEQUENTIAL_DOWNLOAD_DELAY_MS = 2_000;
+// Brief pause between VINs so the browser breathes between fetch calls.
+const SEQUENTIAL_DELAY_MS = 1_000;
 
 // ---------- helpers ----------
 
@@ -34,11 +31,6 @@ const $ = (id) => document.getElementById(id);
 const els = {
   authToken: $("auth-token"),
   tokenMeta: $("token-meta"),
-  enterpriseId: $("enterprise-id"),
-  teamId: $("team-id"),
-  userId: $("user-id"),
-  credsRow: $("creds-row"),
-  credsFromCsvMsg: $("creds-from-csv-msg"),
   csvFile: $("csv-file"),
   csvSummary: $("csv-summary"),
   downloadType: $("download-type"),
@@ -52,9 +44,10 @@ const els = {
   output: $("output"),
 };
 
-let parsedRows = []; // [{mediaId, vin}]
+// [{mediaId, vin, enterpriseId, teamId, userId}]
+let parsedRows = [];
 
-// ---------- credential persistence ----------
+// ---------- credential persistence (token only) ----------
 
 function loadCreds() {
   try {
@@ -62,9 +55,6 @@ function loadCreds() {
     if (!raw) return;
     const data = JSON.parse(raw);
     if (data.authToken) els.authToken.value = data.authToken;
-    if (data.enterpriseId) els.enterpriseId.value = data.enterpriseId;
-    if (data.teamId) els.teamId.value = data.teamId;
-    if (data.userId) els.userId.value = data.userId;
     if (data.tokenSavedAt) {
       const ageDays = (Date.now() - data.tokenSavedAt) / 86_400_000;
       const stamp = new Date(data.tokenSavedAt).toLocaleString();
@@ -80,15 +70,11 @@ function loadCreds() {
 }
 
 function saveCreds() {
-  const data = {
-    authToken: els.authToken.value.trim(),
-    enterpriseId: els.enterpriseId.value.trim(),
-    teamId: els.teamId.value.trim(),
-    userId: els.userId.value.trim(),
-    tokenSavedAt: Date.now(),
-  };
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      authToken: els.authToken.value.trim(),
+      tokenSavedAt: Date.now(),
+    }));
   } catch (e) {
     console.warn("Could not save credentials:", e);
   }
@@ -97,11 +83,8 @@ function saveCreds() {
 function clearCreds() {
   localStorage.removeItem(STORAGE_KEY);
   els.authToken.value = "";
-  els.enterpriseId.value = "";
-  els.teamId.value = "";
-  els.userId.value = "";
   els.tokenMeta.textContent = "";
-  log("Cleared saved credentials.", "warn");
+  log("Cleared saved token.", "warn");
 }
 
 // ---------- CSV parsing ----------
@@ -128,11 +111,11 @@ function parseCSV(text) {
   return rows.filter((r) => r.some((c) => c && c.trim() !== ""));
 }
 
-const MEDIA_ID_HEADERS = ["media id", "mediaid", "media_id", "mediaids", "media ids"];
-const VIN_HEADERS = ["vin", "sku name", "sku", "vin name"];
+const MEDIA_ID_HEADERS     = ["media id", "mediaid", "media_id", "mediaids", "media ids"];
+const VIN_HEADERS          = ["vin", "sku name", "sku", "vin name"];
 const ENTERPRISE_ID_HEADERS = ["enterprise id", "enterpriseid", "enterprise_id", "enterprise"];
-const TEAM_ID_HEADERS = ["team id", "teamid", "team_id", "team"];
-const USER_ID_HEADERS = ["user id", "userid", "user_id", "user"];
+const TEAM_ID_HEADERS      = ["team id", "teamid", "team_id", "team"];
+const USER_ID_HEADERS      = ["user id", "userid", "user_id", "user"];
 
 function findHeaderIndex(headers, candidates) {
   const norm = (s) => s.toLowerCase().trim();
@@ -154,54 +137,89 @@ function loadCSVFile(file) {
       }
       const headers = rows[0];
       const mediaIdx = findHeaderIndex(headers, MEDIA_ID_HEADERS);
-      const vinIdx = findHeaderIndex(headers, VIN_HEADERS);
-      const eidIdx = findHeaderIndex(headers, ENTERPRISE_ID_HEADERS);
-      const tidIdx = findHeaderIndex(headers, TEAM_ID_HEADERS);
-      const uidIdx = findHeaderIndex(headers, USER_ID_HEADERS);
+      const vinIdx   = findHeaderIndex(headers, VIN_HEADERS);
+      const eidIdx   = findHeaderIndex(headers, ENTERPRISE_ID_HEADERS);
+      const tidIdx   = findHeaderIndex(headers, TEAM_ID_HEADERS);
+      const uidIdx   = findHeaderIndex(headers, USER_ID_HEADERS);
+
+      // Media ID column is required.
       if (mediaIdx === -1) {
         log(
-          `CSV is missing a media-ID column. Expected one of: ${MEDIA_ID_HEADERS.join(", ")}. ` +
-          `Found columns: ${headers.join(", ")}`,
+          `CSV is missing a Media ID column. Expected one of: ${MEDIA_ID_HEADERS.join(", ")}. ` +
+          `Found: ${headers.join(", ")}`,
           "err"
         );
         parsedRows = [];
         return;
       }
+
+      // Enterprise ID and Team ID columns are required.
+      if (eidIdx === -1) {
+        log(
+          `CSV is missing an Enterprise ID column. Expected one of: ${ENTERPRISE_ID_HEADERS.join(", ")}. ` +
+          `Found: ${headers.join(", ")}`,
+          "err"
+        );
+        parsedRows = [];
+        return;
+      }
+      if (tidIdx === -1) {
+        log(
+          `CSV is missing a Team ID column. Expected one of: ${TEAM_ID_HEADERS.join(", ")}. ` +
+          `Found: ${headers.join(", ")}`,
+          "err"
+        );
+        parsedRows = [];
+        return;
+      }
+
       const seen = new Set();
       parsedRows = [];
+      const missingCreds = [];
+
       for (let i = 1; i < rows.length; i++) {
-        const m = (rows[i][mediaIdx] || "").trim();
+        const m  = (rows[i][mediaIdx] || "").trim();
         if (!m || seen.has(m)) continue;
         seen.add(m);
+
+        const enterpriseId = (rows[i][eidIdx] || "").trim();
+        const teamId       = (rows[i][tidIdx] || "").trim();
+        const userId       = uidIdx >= 0 ? (rows[i][uidIdx] || "").trim() : "";
+
+        if (!enterpriseId || !teamId) {
+          missingCreds.push(`row ${i + 1} (${m})`);
+        }
+
         parsedRows.push({
           mediaId: m,
           vin: vinIdx >= 0 ? (rows[i][vinIdx] || "").trim() : "",
-          enterpriseId: eidIdx >= 0 ? (rows[i][eidIdx] || "").trim() : "",
-          teamId: tidIdx >= 0 ? (rows[i][tidIdx] || "").trim() : "",
-          userId: uidIdx >= 0 ? (rows[i][uidIdx] || "").trim() : "",
+          enterpriseId,
+          teamId,
+          userId,
         });
       }
-      // Auto-fill the credential form fields from the first row that supplies them,
-      // so users who put creds in the CSV don't also have to paste them above.
-      if (parsedRows.length) {
-        const first = parsedRows[0];
-        if (first.enterpriseId && !els.enterpriseId.value.trim()) els.enterpriseId.value = first.enterpriseId;
-        if (first.teamId && !els.teamId.value.trim()) els.teamId.value = first.teamId;
-        if (first.userId && !els.userId.value.trim()) els.userId.value = first.userId;
+
+      if (missingCreds.length) {
+        log(
+          `Warning: ${missingCreds.length} row(s) are missing Enterprise ID or Team ID: ` +
+          missingCreds.slice(0, 5).join(", ") +
+          (missingCreds.length > 5 ? ` … and ${missingCreds.length - 5} more.` : "."),
+          "warn"
+        );
       }
-      // Hide the form's credential fields if the CSV is supplying them on every row.
-      const csvHasFullCreds =
-        eidIdx >= 0 && tidIdx >= 0 &&
-        parsedRows.every((r) => r.enterpriseId && r.teamId);
-      if (els.credsRow) els.credsRow.hidden = !!csvHasFullCreds;
-      if (els.credsFromCsvMsg) els.credsFromCsvMsg.hidden = !csvHasFullCreds;
 
       const extras = [];
       if (vinIdx >= 0) extras.push("VIN labels");
-      if (eidIdx >= 0 || tidIdx >= 0 || uidIdx >= 0) extras.push("per-row credentials");
+      if (uidIdx >= 0) extras.push("User ID");
+
       els.csvSummary.textContent =
         `Loaded ${parsedRows.length} unique media ID${parsedRows.length === 1 ? "" : "s"} from ${file.name}` +
         (extras.length ? ` (with ${extras.join(" and ")}).` : ".");
+
+      log(
+        `CSV parsed: ${parsedRows.length} rows — credentials read from CSV columns.`,
+        missingCreds.length ? "warn" : "ok"
+      );
     } catch (e) {
       log(`Failed to parse CSV: ${e.message}`, "err");
       parsedRows = [];
@@ -224,17 +242,15 @@ function log(msg, kind = "info") {
   els.output.scrollTop = els.output.scrollHeight;
 }
 
-// ---------- API call ----------
+// ---------- API helpers ----------
 
 function buildPayload(row) {
-  // Per-VIN POST does not include mediaIds — the mediaId is in the URL path.
-  // Each CSV row may override the form's credentials; otherwise we use the
-  // values typed into section 1.
-  const enterpriseId = (row?.enterpriseId || els.enterpriseId.value).trim();
-  const userId = (row?.userId || els.userId.value).trim();
-  const teamId = (row?.teamId || els.teamId.value).trim();
   return {
-    userData: { enterpriseId, userId, teamId },
+    userData: {
+      enterpriseId: row.enterpriseId,
+      teamId: row.teamId,
+      userId: row.userId || "",
+    },
     downloadRequestData: {
       downloadType: els.downloadType.value,
       formatType: els.formatType.value,
@@ -245,11 +261,9 @@ function buildPayload(row) {
 }
 
 function newRequestId() {
-  // crypto.randomUUID is available in all modern browsers (Chrome 92+, Safari 15.4+, Firefox 95+).
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
   }
-  // Fallback for older browsers.
   return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
     const r = (Math.random() * 16) | 0;
     return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
@@ -257,8 +271,6 @@ function newRequestId() {
 }
 
 function buildHeaders(token) {
-  // Browsers won't let JS set Origin, Referer, or Sec-* headers — they're populated automatically.
-  // X-Request-Id is required by Spyne's API; we generate a fresh UUID per call.
   return {
     accept: "application/json, text/plain, */*",
     authorization: token.startsWith("Bearer ") ? token : `Bearer ${token}`,
@@ -268,13 +280,29 @@ function buildHeaders(token) {
 }
 
 async function callPerVinPost(mediaId, payload, token) {
-  const res = await fetch(PER_VIN_POST_URL(mediaId), {
+  return fetch(PER_VIN_POST_URL(mediaId), {
     method: "POST",
     headers: buildHeaders(token),
     body: JSON.stringify(payload),
     mode: "cors",
   });
-  return res;
+}
+
+/** Save a Blob to disk via a hidden <a download>. */
+function saveBlob(blob, filename) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
+}
+
+/** Sanitize a string for use as a filename/folder-name entry. */
+function safeFilename(name, fallback = "download") {
+  const cleaned = String(name || fallback).replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim();
+  return cleaned || fallback;
 }
 
 /** Try to find a usable download URL anywhere in the API response. */
@@ -301,29 +329,19 @@ function extractDownloadUrl(json, preferredProduct) {
   );
 }
 
-/** Save a Blob to disk via a hidden <a download>. */
-function saveBlob(blob, filename) {
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
-}
+// ---------- master ZIP ----------
 
-/** Sanitize a string for use as a filename. */
-function safeFilename(name, fallback = "download") {
-  const cleaned = String(name || fallback).replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim();
-  return cleaned || fallback;
-}
+// One JSZip instance is reused across the whole run.  Each VIN's ZIP blob is
+// added as an entry; when everything is done we generate one combined download.
+let masterZip = null;
+let masterZipEntries = 0;
 
-/** Try to fetch this VIN's ZIP and add it to the master ZIP under {VIN}.zip.
- *  If the fetch fails (typically CORS on the S3 URL), fall back to opening the
- *  URL in a new tab so the browser saves it to the default Downloads folder.
+/** Fetch a signed URL and add the blob to masterZip under "{VIN}.zip".
+ *  Falls back to window.open() if the fetch is blocked by CORS on the S3 URL.
  */
 async function deliverDownload(url, row, label) {
   const entryName = `${safeFilename(row.vin || row.mediaId)}.zip`;
+
   if (masterZip) {
     try {
       const res = await fetch(url, { mode: "cors" });
@@ -335,27 +353,25 @@ async function deliverDownload(url, row, label) {
       return;
     } catch (e) {
       log(
-        `  Could not fetch ${entryName} for the master ZIP (${e.message}). ` +
-        `Opening the URL directly so the browser saves it to your default Downloads folder…`,
+        `  Could not fetch ${entryName} for master ZIP (${e.message}). ` +
+        `Opening URL directly — browser will save it to your default Downloads folder.`,
         "warn"
       );
-      // Fall through to window.open below.
     }
   }
   window.open(url, "_blank", "noopener");
   log(`  ✓ ${label}: download URL opened in a new tab.`, "ok");
 }
 
-/** Result codes for fetchPerMediaDownload(). */
-const RESULT_DOWNLOADED = "downloaded";   // file saved or URL opened — done
-const RESULT_PENDING = "pending";         // still preparing — retry later
-const RESULT_FAILED = "failed";           // hard failure — don't retry
+// ---------- per-VIN polling ----------
 
-/** Hit the per-media GET endpoint and turn the response into a download.
- *  Returns one of RESULT_DOWNLOADED / RESULT_PENDING / RESULT_FAILED. */
+const RESULT_DOWNLOADED = "downloaded";
+const RESULT_PENDING    = "pending";
+const RESULT_FAILED     = "failed";
+
 async function fetchPerMediaDownload(row, requestId, token, { quiet = false } = {}) {
-  const url = PER_MEDIA_URL(row.mediaId, requestId);
-  const label = row.vin ? `${row.mediaId}  (VIN ${row.vin})` : row.mediaId;
+  const url   = PER_MEDIA_URL(row.mediaId, requestId);
+  const label = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
 
   const res = await fetch(url, {
     method: "GET",
@@ -371,7 +387,6 @@ async function fetchPerMediaDownload(row, requestId, token, { quiet = false } = 
 
   if (!res.ok) {
     const txt = await res.text().catch(() => res.statusText);
-    // 404 right after POST often means "not yet available"; treat as pending.
     if (res.status === 404 || res.status === 425 || /not.?ready|in[\s_-]?progress/i.test(txt)) {
       if (!quiet) log(`  ⋯ ${label}: still preparing (HTTP ${res.status}). Will retry.`, "warn");
       return RESULT_PENDING;
@@ -386,13 +401,9 @@ async function fetchPerMediaDownload(row, requestId, token, { quiet = false } = 
     const products = json?.data?.products || json?.products;
     const PENDING_STATES = ["pending", "in_progress", "yet_to_start", "queued", "processing"];
 
-    // Spyne's per-media GET response shape is:
-    //   { data: { status: "COMPLETED", products: { CATALOG: { status: "COMPLETED", url: "https://..." } } } }
-    // Hunt for the first product with a usable download URL.
     let downloadUrl = null;
     let anyProductPending = false;
     if (products && typeof products === "object") {
-      // Prefer the product the user actually selected.
       const preferredKey = els.downloadProduct?.value;
       const orderedKeys = preferredKey && products[preferredKey]
         ? [preferredKey, ...Object.keys(products).filter((k) => k !== preferredKey)]
@@ -400,80 +411,54 @@ async function fetchPerMediaDownload(row, requestId, token, { quiet = false } = 
       for (const key of orderedKeys) {
         const p = products[key] || {};
         const purl = p.url || p.downloadUrl || p.signedUrl;
-        const pstatus = (p.status || "").toLowerCase();
-        if (typeof purl === "string" && purl.startsWith("http")) {
-          downloadUrl = purl;
-          break;
-        }
-        if (PENDING_STATES.includes(pstatus)) anyProductPending = true;
+        if (typeof purl === "string" && purl.startsWith("http")) { downloadUrl = purl; break; }
+        if (PENDING_STATES.includes((p.status || "").toLowerCase())) anyProductPending = true;
       }
     }
-    // Fallback to flat URL fields if products didn't yield one.
     if (!downloadUrl) {
       downloadUrl =
-        json?.data?.downloadUrl ||
-        json?.data?.url ||
-        json?.data?.signedUrl ||
-        json?.downloadUrl ||
-        json?.url ||
-        json?.signedUrl ||
-        null;
+        json?.data?.downloadUrl || json?.data?.url || json?.data?.signedUrl ||
+        json?.downloadUrl || json?.url || json?.signedUrl || null;
     }
 
     if (typeof downloadUrl === "string" && downloadUrl.startsWith("http")) {
       await deliverDownload(downloadUrl, row, label);
       return RESULT_DOWNLOADED;
     }
-
     if (PENDING_STATES.includes(overallStatus) || anyProductPending) {
       if (!quiet) log(`  ⋯ ${label}: still preparing (${overallStatus || "in_progress"}). Will retry.`, "warn");
       return RESULT_PENDING;
     }
-
-    // Completed but no URL — surface the response so we can extend the parser.
-    log(`  ! ${label}: ${JSON.stringify(json).slice(0, 280)}`, "err");
+    log(`  ! ${label}: unrecognised response shape — ${JSON.stringify(json).slice(0, 280)}`, "err");
     return RESULT_FAILED;
   }
 
-  // Anything non-JSON we treat as the file itself.
+  // Binary response — treat as the file itself.
   const blob = await res.blob();
-  const ext = ctype.includes("zip") ? "zip" : "bin";
+  const ext  = ctype.includes("zip") ? "zip" : "bin";
   const fname = `${safeFilename(row.vin || row.mediaId)}.${ext}`;
-  if (downloadDirHandle) {
-    try {
-      const fh = await downloadDirHandle.getFileHandle(fname, { create: true });
-      const w = await fh.createWritable();
-      await w.write(blob);
-      await w.close();
-      log(`  ✓ ${label}: saved ${fname} (${(blob.size / 1024 / 1024).toFixed(2)} MB) to ${downloadDirHandle.name}/`, "ok");
-      return RESULT_DOWNLOADED;
-    } catch (e) {
-      log(`  Folder save failed (${e.message}); using default Downloads folder.`, "warn");
-    }
+  if (masterZip) {
+    masterZip.file(fname, blob);
+    masterZipEntries++;
+    log(`  ✓ ${label}: added ${fname} (${(blob.size / 1024 / 1024).toFixed(2)} MB) to master ZIP.`, "ok");
+  } else {
+    saveBlob(blob, fname);
+    log(`  ✓ ${label}: saved ${fname} (${(blob.size / 1024 / 1024).toFixed(2)} MB).`, "ok");
   }
-  saveBlob(blob, fname);
-  log(`  ✓ ${label}: saved ${fname} (${(blob.size / 1024 / 1024).toFixed(2)} MB) to default Downloads`, "ok");
   return RESULT_DOWNLOADED;
 }
 
-/** Poll a single VIN's per-media GET until its ZIP is ready, then trigger one
- *  download. Returns true on success, false on hard failure or timeout.
- */
 async function pollAndDownloadOne(row, requestId, token, idx, total) {
-  const label = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
+  const label  = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
   const prefix = `[${idx + 1}/${total}]`;
-
   const startMs = Date.now();
-  let attempt = 0;
-  let backoffIdx = 0;
+  let attempt = 0, backoffIdx = 0;
 
   while (Date.now() - startMs < POLL_MAX_MS) {
     attempt++;
-
     if (attempt > 1) {
       const wait = POLL_INTERVALS_MS[Math.min(backoffIdx, POLL_INTERVALS_MS.length - 1)];
-      const elapsed = Date.now() - startMs;
-      log(`${prefix}   …still preparing (elapsed ${(elapsed / 1000).toFixed(0)}s). Waiting ${(wait / 1000).toFixed(0)}s.`);
+      log(`${prefix}   …still preparing (${((Date.now() - startMs) / 1000).toFixed(0)}s elapsed). Waiting ${(wait / 1000).toFixed(0)}s.`);
       await new Promise((r) => setTimeout(r, wait));
     }
 
@@ -486,150 +471,56 @@ async function pollAndDownloadOne(row, requestId, token, idx, total) {
     }
 
     if (result === RESULT_DOWNLOADED) {
-      const totalSec = ((Date.now() - startMs) / 1000).toFixed(1);
-      log(`${prefix}   ✓ ${label}: triggered after ${totalSec}s.`, "ok");
+      log(`${prefix}   ✓ ${label}: done after ${((Date.now() - startMs) / 1000).toFixed(1)}s.`, "ok");
       return true;
     }
     if (result === RESULT_FAILED) {
-      log(`${prefix}   ✗ ${label}: hard failure — see response above.`, "err");
+      log(`${prefix}   ✗ ${label}: hard failure — see above.`, "err");
       return false;
     }
     backoffIdx++;
   }
 
-  log(`${prefix}   ⏱  ${label}: ${(POLL_MAX_MS / 60000).toFixed(0)}-min polling cap hit, still pending.`, "warn");
+  log(`${prefix}   ⏱  ${label}: ${(POLL_MAX_MS / 60000).toFixed(0)}-min cap hit, still pending.`, "warn");
   return false;
 }
 
-/** Process every VIN strictly sequentially: poll until that VIN's ZIP is ready,
- *  trigger its download, wait for the browser to start saving, then move to
- *  the next. This way the per-VIN images (sequenced inside each ZIP via
- *  `isSequence: true`) also arrive on disk in VIN order, one at a time.
- */
-async function downloadEachMedia(rows, requestId, token) {
-  if (!rows.length) return;
+// ---------- state for re-fetch ----------
 
-  log(
-    `Sequential per-VIN download for request ID ${requestId} ` +
-    `(${rows.length} VIN${rows.length === 1 ? "" : "s"} — one at a time, images in sequence inside each ZIP).`
-  );
-
-  const startMs = Date.now();
-  let succeeded = 0, failed = 0;
-
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    const label = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
-    log(`[${i + 1}/${rows.length}] Starting ${label}…`);
-
-    const ok = await pollAndDownloadOne(row, requestId, token, i, rows.length);
-    if (ok) succeeded++; else failed++;
-
-    // Pause after a successful trigger so the browser starts saving the ZIP
-    // before we open the next tab. Skip this delay on the very last item.
-    if (ok && i < rows.length - 1) {
-      log(`  Waiting ${(SEQUENTIAL_DOWNLOAD_DELAY_MS / 1000).toFixed(1)}s before the next VIN…`);
-      await new Promise((r) => setTimeout(r, SEQUENTIAL_DOWNLOAD_DELAY_MS));
-    }
-  }
-
-  const totalSec = ((Date.now() - startMs) / 1000).toFixed(1);
-  log(
-    `Sequential downloads done in ${totalSec}s. Success=${succeeded}  Failure=${failed}`,
-    failed ? "warn" : "ok"
-  );
-}
-
-// Set after a successful run so the user can re-fetch downloads later
-// (e.g., once the per-VIN jobs finish) without re-submitting.
 let lastRows = [];
-let lastRequestIdsByMedia = new Map(); // mediaId -> requestId
+let lastRequestIdsByMedia = new Map();
 
-// Master ZIP being built during the current run (one entry per VIN).
-let masterZip = null;
-let masterZipEntries = 0;
+// ---------- finalize master ZIP ----------
 
-/** Try to make a download happen from whatever shape the API responds with. */
-async function handleResponse(res, token) {
-  const ctype = (res.headers.get("content-type") || "").toLowerCase();
-
-  if (ctype.includes("application/json")) {
-    const json = await res.json().catch(() => null);
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status} — ${JSON.stringify(json) || res.statusText}`);
+async function finalizeMasterZip(label = "") {
+  if (!masterZip || masterZipEntries === 0) {
+    if (masterZip) {
+      log(
+        "No VINs were added to the master ZIP — every fetch fell back to a tab. " +
+        "If this is CORS-related, deploy the Cloudflare Worker proxy (see README).",
+        "warn"
+      );
     }
-
-    // 1) Inline download URL?
-    const url =
-      json?.downloadUrl ||
-      json?.download_url ||
-      json?.data?.downloadUrl ||
-      json?.data?.download_url ||
-      json?.url ||
-      json?.signedUrl;
-    if (typeof url === "string" && url.startsWith("http")) {
-      log(`Triggering download: ${url}`, "ok");
-      window.open(url, "_blank", "noopener");
-      return;
-    }
-
-    // 2) Async accepted — extract requestId and trigger per-media GETs.
-    const requestId =
-      json?.data?.requestId ||
-      json?.requestId ||
-      json?.jobId ||
-      json?.data?.jobId;
-    const acceptedStatuses = ["in_progress", "yet_to_start", "queued", "pending", "processing"];
-    const status = (json?.data?.status || json?.status || "").toLowerCase();
-
-    if (requestId || acceptedStatuses.includes(status) ||
-        (typeof json?.message === "string" && /accepted|in[\s_-]?progress/i.test(json.message))) {
-      log(`Spyne accepted the request. ${json?.message || ""}`.trim(), "ok");
-      if (requestId) log(`  Request ID: ${requestId}`, "ok");
-
-      if (requestId) {
-        lastRequestId = requestId;
-        lastRows = parsedRows.slice();
-        els.refetchBtn.hidden = false;
-        // No arbitrary up-front delay — drive everything off the GET response status.
-        await downloadEachMedia(parsedRows, requestId, token);
-      } else {
-        log(
-          "Server didn't return a request ID, so per-media GETs aren't possible. " +
-          "Spyne will deliver the ZIP via in-app notification or email when ready.",
-          "warn"
-        );
-      }
-      return;
-    }
-
-    // 3) Truly nothing actionable — dump the raw response.
-    log(`Server response: ${JSON.stringify(json)}`, "warn");
-    log("Request succeeded but the response shape isn't recognised. Share this with the developer to extend the parser.", "warn");
+    masterZip = null;
+    masterZipEntries = 0;
     return;
   }
 
-  // Binary response — treat as the file itself.
-  if (res.ok) {
-    const blob = await res.blob();
-    const name = (res.headers.get("content-disposition") || "").match(/filename="?([^"]+)"?/)?.[1] ||
-                 `spyne-bulk-${Date.now()}.zip`;
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = name;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(a.href);
-    log(`Downloaded ${name} (${(blob.size / 1024 / 1024).toFixed(2)} MB)`, "ok");
-    return;
+  log(`Building master ZIP with ${masterZipEntries} VIN${masterZipEntries === 1 ? "" : "s"}…`);
+  try {
+    const blob = await masterZip.generateAsync({ type: "blob", compression: "STORE" });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const filename = `spyne-downloads-${stamp}.zip`;
+    saveBlob(blob, filename);
+    log(`✓ Master ZIP saved: ${filename} (${(blob.size / 1024 / 1024).toFixed(2)} MB).${label}`, "ok");
+  } catch (e) {
+    log(`Could not build master ZIP: ${e.message}`, "err");
   }
-
-  const text = await res.text().catch(() => res.statusText);
-  throw new Error(`HTTP ${res.status} — ${text}`);
+  masterZip = null;
+  masterZipEntries = 0;
 }
 
-// ---------- main flow ----------
+// ---------- main download flow ----------
 
 async function onDownloadClick() {
   els.output.innerHTML = "";
@@ -637,17 +528,22 @@ async function onDownloadClick() {
 
   const token = els.authToken.value.trim();
   if (!token) return log("Authorization token is required.", "err");
-  if (!els.enterpriseId.value.trim()) return log("Enterprise ID is required.", "err");
-  if (!els.teamId.value.trim()) return log("Team ID is required.", "err");
   if (!parsedRows.length) return log("Upload a CSV with at least one media ID.", "err");
+
+  // Validate that every row has credentials.
+  const badRows = parsedRows.filter((r) => !r.enterpriseId || !r.teamId);
+  if (badRows.length) {
+    return log(
+      `${badRows.length} row(s) are missing Enterprise ID or Team ID. ` +
+      `Please fix the CSV and re-upload.`,
+      "err"
+    );
+  }
 
   saveCreds();
   lastRows = parsedRows.slice();
   lastRequestIdsByMedia = new Map();
 
-  // Build a master ZIP if JSZip is available. As each VIN's ZIP comes back,
-  // we add it as an entry; at the end we generate one combined ZIP file and
-  // trigger a single download.
   if (typeof JSZip === "function") {
     masterZip = new JSZip();
     masterZipEntries = 0;
@@ -657,9 +553,9 @@ async function onDownloadClick() {
   }
 
   log(
-    `Will process ${parsedRows.length} VIN${parsedRows.length === 1 ? "" : "s"} ` +
-    `sequentially via POST /medias/{mediaId}/download` +
-    (masterZip ? ` and bundle them into one master ZIP.` : `.`)
+    `Processing ${parsedRows.length} VIN${parsedRows.length === 1 ? "" : "s"} ` +
+    `sequentially` +
+    (masterZip ? ` — will bundle all into one master ZIP.` : `.`)
   );
 
   els.downloadBtn.disabled = true;
@@ -669,9 +565,9 @@ async function onDownloadClick() {
 
   try {
     for (let i = 0; i < parsedRows.length; i++) {
-      const row = parsedRows[i];
+      const row   = parsedRows[i];
       const label = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
-      const tag = `[${i + 1}/${parsedRows.length}]`;
+      const tag   = `[${i + 1}/${parsedRows.length}]`;
       log(`${tag} POST /medias/${row.mediaId}/download …`);
 
       try {
@@ -684,14 +580,12 @@ async function onDownloadClick() {
           failed++;
         } else {
           const json = await postRes.json().catch(() => null);
-
-          // Case A: POST is synchronous and already returns a download URL.
           const directUrl = extractDownloadUrl(json, els.downloadProduct.value);
+
           if (typeof directUrl === "string" && directUrl.startsWith("http")) {
             await deliverDownload(directUrl, row, label);
             succeeded++;
           } else {
-            // Case B: POST is async — polling required via the GET endpoint.
             const requestId =
               json?.data?.requestId || json?.requestId || json?.jobId || json?.data?.jobId;
             if (!requestId) {
@@ -714,10 +608,8 @@ async function onDownloadClick() {
         failed++;
       }
 
-      // Pause between VINs so the browser starts saving the previous ZIP first.
       if (i < parsedRows.length - 1) {
-        log(`  Waiting ${(SEQUENTIAL_DOWNLOAD_DELAY_MS / 1000).toFixed(1)}s before next VIN…`);
-        await new Promise((r) => setTimeout(r, SEQUENTIAL_DOWNLOAD_DELAY_MS));
+        await new Promise((r) => setTimeout(r, SEQUENTIAL_DELAY_MS));
       }
     }
   } finally {
@@ -726,33 +618,14 @@ async function onDownloadClick() {
 
   const totalSec = ((Date.now() - startMs) / 1000).toFixed(1);
   log(
-    `All VINs processed in ${totalSec}s. Success=${succeeded}  Failure=${failed}`,
+    `All VINs processed in ${totalSec}s — Success: ${succeeded}  Failed: ${failed}`,
     failed ? "warn" : "ok"
   );
 
-  // Finalize the master ZIP if any entries were collected.
-  if (masterZip && masterZipEntries > 0) {
-    log(`Building master ZIP with ${masterZipEntries} VIN${masterZipEntries === 1 ? "" : "s"}…`);
-    try {
-      const blob = await masterZip.generateAsync({ type: "blob", compression: "STORE" });
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      saveBlob(blob, `spyne-downloads-${stamp}.zip`);
-      log(`Master ZIP saved (${(blob.size / 1024 / 1024).toFixed(2)} MB).`, "ok");
-    } catch (e) {
-      log(`Could not build master ZIP: ${e.message}`, "err");
-    }
-  } else if (masterZip && masterZipEntries === 0) {
-    log(
-      "No VINs were added to the master ZIP — every fetch fell back to a tab. " +
-      "If this happened due to CORS, you'll need a small Cloudflare Worker proxy (see README).",
-      "warn"
-    );
-  }
-  masterZip = null;
-  masterZipEntries = 0;
+  await finalizeMasterZip(` Contains ${succeeded} VIN${succeeded === 1 ? "" : "s"}.`);
 }
 
-// ---------- wire up ----------
+// ---------- re-fetch flow ----------
 
 async function onRefetchClick() {
   if (!lastRequestIdsByMedia.size || !lastRows.length) {
@@ -762,7 +635,6 @@ async function onRefetchClick() {
   const token = els.authToken.value.trim();
   if (!token) return log("Authorization token is required.", "err");
 
-  // Build a fresh master ZIP for this re-fetch run.
   if (typeof JSZip === "function") {
     masterZip = new JSZip();
     masterZipEntries = 0;
@@ -773,8 +645,9 @@ async function onRefetchClick() {
   els.refetchBtn.disabled = true;
   const startMs = Date.now();
   let succeeded = 0, failed = 0;
+
   try {
-    log(`Re-fetching ${lastRows.length} VIN${lastRows.length === 1 ? "" : "s"} using previously-saved request IDs…`);
+    log(`Re-fetching ${lastRows.length} VIN${lastRows.length === 1 ? "" : "s"} using saved request IDs…`);
     for (let i = 0; i < lastRows.length; i++) {
       const row = lastRows[i];
       const requestId = lastRequestIdsByMedia.get(row.mediaId);
@@ -787,28 +660,20 @@ async function onRefetchClick() {
       const ok = await pollAndDownloadOne(row, requestId, token, i, lastRows.length);
       if (ok) succeeded++; else failed++;
       if (i < lastRows.length - 1) {
-        await new Promise((r) => setTimeout(r, SEQUENTIAL_DOWNLOAD_DELAY_MS));
+        await new Promise((r) => setTimeout(r, SEQUENTIAL_DELAY_MS));
       }
     }
   } finally {
     els.refetchBtn.disabled = false;
   }
-  const totalSec = ((Date.now() - startMs) / 1000).toFixed(1);
-  log(`Re-fetch done in ${totalSec}s. Success=${succeeded}  Failure=${failed}`, failed ? "warn" : "ok");
 
-  if (masterZip && masterZipEntries > 0) {
-    try {
-      const blob = await masterZip.generateAsync({ type: "blob", compression: "STORE" });
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      saveBlob(blob, `spyne-downloads-${stamp}.zip`);
-      log(`Master ZIP saved with ${masterZipEntries} VIN(s) (${(blob.size / 1024 / 1024).toFixed(2)} MB).`, "ok");
-    } catch (e) {
-      log(`Could not build master ZIP: ${e.message}`, "err");
-    }
-  }
-  masterZip = null;
-  masterZipEntries = 0;
+  const totalSec = ((Date.now() - startMs) / 1000).toFixed(1);
+  log(`Re-fetch done in ${totalSec}s — Success: ${succeeded}  Failed: ${failed}`, failed ? "warn" : "ok");
+
+  await finalizeMasterZip(` Contains ${succeeded} VIN${succeeded === 1 ? "" : "s"}.`);
 }
+
+// ---------- wire up ----------
 
 document.addEventListener("DOMContentLoaded", () => {
   loadCreds();
