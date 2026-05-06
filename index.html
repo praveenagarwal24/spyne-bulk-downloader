@@ -12,17 +12,18 @@
     <header>
       <h1>Spyne Bulk Media Downloader</h1>
       <p class="subtitle">
-        Upload a CSV of media IDs, paste your Spyne credentials, hit Download.
-        Calls <code>api.spyne.ai/medias/bulk-download</code> directly from your browser.
+        Upload a CSV with media IDs and credentials, paste your auth token, hit Download.
+        All VINs are bundled into one ZIP. Calls <code>api.spyne.ai/medias/bulk-download</code> directly from your browser.
       </p>
     </header>
 
     <section class="card">
-      <h2>1. Your Spyne credentials</h2>
+      <h2>1. Authorization token</h2>
       <p class="hint">
         Open <a href="https://console.spyne.ai" target="_blank" rel="noopener">console.spyne.ai</a>,
-        log in, then open DevTools&nbsp;→&nbsp;Network tab. Trigger any action,
-        click any request, and copy the values. They're saved locally in your browser.
+        log in, then open DevTools&nbsp;&rarr;&nbsp;Network tab. Trigger any action,
+        click any request, copy the <code>authorization</code> header value.
+        Saved locally in your browser; expires every 5&ndash;6 days.
       </p>
 
       <label>
@@ -30,39 +31,16 @@
         <textarea id="auth-token" rows="2" placeholder="eyJhbGciOi..."></textarea>
         <small id="token-meta" class="muted"></small>
       </label>
-
-      <div class="row" id="creds-row">
-        <label>
-          <span>Enterprise ID</span>
-          <input id="enterprise-id" placeholder="e.g. 82255fce5" autocomplete="off" />
-        </label>
-
-        <label>
-          <span>Team ID</span>
-          <input id="team-id" placeholder="e.g. e0b1ded2d8" autocomplete="off" />
-        </label>
-
-        <label>
-          <span>User ID <small class="muted">(optional)</small></span>
-          <input id="user-id" placeholder="leave blank if unsure" autocomplete="off" />
-        </label>
-      </div>
-
-      <p id="creds-from-csv-msg" class="muted" hidden>
-        ✓ Enterprise / Team / User IDs are coming from your CSV — no need to type them here.
-      </p>
     </section>
 
     <section class="card">
       <h2>2. Media IDs (CSV upload)</h2>
       <p class="hint">
-        CSV must contain a column named <code>Media ID</code> (case-insensitive; also accepts
-        <code>mediaId</code>, <code>media_id</code>). Each Media ID must be a real
-        24-character Spyne ObjectId (e.g. <code>69f53edf315b2a8070388552</code>) —
-        you can grab them from <code>console.spyne.ai</code>'s DevTools → Network tab.
-        Optional columns: <code>VIN</code> / <code>Sku Name</code> for labels, plus
-        <code>Enterprise ID</code>, <code>Team ID</code>, <code>User ID</code> to
-        provide credentials per-row (the form fields above will hide automatically).
+        CSV <strong>must</strong> include these columns (case-insensitive):
+        <code>Media ID</code>, <code>Enterprise ID</code>, <code>Team ID</code>.<br/>
+        Optional columns: <code>User ID</code>, <code>VIN</code> / <code>Sku Name</code> for labels.<br/>
+        Each Media ID must be a real 24-character Spyne ObjectId (e.g.&nbsp;<code>69f53edf315b2a8070388552</code>).
+        Grab them from <code>console.spyne.ai</code> DevTools &rarr; Network tab.
       </p>
 
       <input type="file" id="csv-file" accept=".csv,text/csv" />
@@ -106,9 +84,9 @@
     </section>
 
     <section class="actions">
-      <button id="download-btn" class="primary">Download</button>
+      <button id="download-btn" class="primary">Download All as ZIP</button>
       <button id="refetch-btn" class="ghost" hidden title="Retry per-media downloads using the most recent request ID">Re-fetch downloads</button>
-      <button id="clear-creds-btn" class="ghost" title="Clear saved credentials">Clear saved credentials</button>
+      <button id="clear-creds-btn" class="ghost" title="Clear saved token">Clear saved token</button>
     </section>
 
     <section class="card output" id="output-card" hidden>
