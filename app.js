@@ -1,127 +1,149 @@
 /* Spyne Bulk Media Downloader — front-end logic.
- * Calls https://api.spyne.ai/medias/{mediaId}/download per VIN.
- * Enterprise ID, Team ID, and User ID are read exclusively from the CSV.
- * All VINs are collected into one master ZIP for a single download trigger.
+ * Enterprise ID, Team ID, User ID come exclusively from the CSV.
  *
- * If Spyne's CORS rejects the call (origin must be console.spyne.ai), deploy
- * the optional proxy described in README.md.
+ * DOWNLOAD STRATEGY (three modes, auto-selected at runtime):
+ *
+ *  Mode A — PROXY + master ZIP
+ *    User pastes their Cloudflare Worker URL into the UI.
+ *    The Worker's /fetch-url endpoint fetches each S3 signed URL server-side
+ *    and returns the bytes with permissive CORS, so JSZip can collect all blobs
+ *    into one master ZIP that the browser downloads as a single file.
+ *
+ *  Mode B — FOLDER PICKER  (no proxy needed)
+ *    User clicks "Choose folder". Each VIN ZIP is fetched via the proxy if set,
+ *    otherwise fetched directly (works if CORS allows it), and written into the
+ *    chosen folder via the File System Access API (Chrome/Edge 86+).
+ *
+ *  Mode C — TAB FALLBACK
+ *    window.open() per VIN. Files land in the browser's default Downloads folder.
  */
 
-// Per-VIN POST endpoint: POST /medias/{mediaId}/download
-const PER_VIN_POST_URL = (mediaId) =>
-  `https://api.spyne.ai/medias/${encodeURIComponent(mediaId)}/download`;
+const STORAGE_KEY = "spyne-bulk-downloader/v3";
 
-// Status / direct-download GET for a previously-issued request.
-const PER_MEDIA_URL = (mediaId, requestId) =>
-  `https://api.spyne.ai/medias/${encodeURIComponent(mediaId)}/download/${encodeURIComponent(requestId)}`;
-
-const STORAGE_KEY = "spyne-bulk-downloader/v2";
-
-// Polling back-off intervals (ms).
 const POLL_INTERVALS_MS = [3_000, 5_000, 10_000, 15_000, 30_000];
-const POLL_MAX_MS = 15 * 60 * 1000; // 15 minutes hard cap
-
-// Brief pause between VINs so the browser breathes between fetch calls.
-const SEQUENTIAL_DELAY_MS = 1_000;
+const POLL_MAX_MS       = 15 * 60 * 1000;
+const SEQUENTIAL_DELAY  = 1_000;
 
 // ---------- helpers ----------
 
 const $ = (id) => document.getElementById(id);
 
 const els = {
-  authToken: $("auth-token"),
-  tokenMeta: $("token-meta"),
-  csvFile: $("csv-file"),
-  csvSummary: $("csv-summary"),
-  downloadType: $("download-type"),
-  formatType: $("format-type"),
-  isSequence: $("is-sequence"),
+  authToken:       $("auth-token"),
+  tokenMeta:       $("token-meta"),
+  proxyUrl:        $("proxy-url"),
+  csvFile:         $("csv-file"),
+  csvSummary:      $("csv-summary"),
+  downloadType:    $("download-type"),
+  formatType:      $("format-type"),
+  isSequence:      $("is-sequence"),
   downloadProduct: $("download-product"),
-  downloadBtn: $("download-btn"),
-  refetchBtn: $("refetch-btn"),
-  clearCredsBtn: $("clear-creds-btn"),
-  outputCard: $("output-card"),
-  output: $("output"),
+  downloadBtn:     $("download-btn"),
+  refetchBtn:      $("refetch-btn"),
+  clearCredsBtn:   $("clear-creds-btn"),
+  pickFolderBtn:   $("pick-folder-btn"),
+  folderStatus:    $("folder-status"),
+  folderUnsupported: $("folder-unsupported"),
+  outputCard:      $("output-card"),
+  output:          $("output"),
 };
 
-// [{mediaId, vin, enterpriseId, teamId, userId}]
-let parsedRows = [];
+let parsedRows       = [];   // [{mediaId, vin, enterpriseId, teamId, userId}]
+let downloadDirHandle = null; // FileSystemDirectoryHandle
 
-// ---------- credential persistence (token only) ----------
+// ---------- runtime config helpers ----------
+
+function proxyBase() {
+  return (els.proxyUrl?.value || "").trim().replace(/\/$/, "");
+}
+function perVinPostUrl(mediaId) {
+  const b = proxyBase();
+  return b
+    ? `${b}/medias/${encodeURIComponent(mediaId)}/download`
+    : `https://api.spyne.ai/medias/${encodeURIComponent(mediaId)}/download`;
+}
+function perMediaGetUrl(mediaId, requestId) {
+  const b = proxyBase();
+  return b
+    ? `${b}/medias/${encodeURIComponent(mediaId)}/download/${encodeURIComponent(requestId)}`
+    : `https://api.spyne.ai/medias/${encodeURIComponent(mediaId)}/download/${encodeURIComponent(requestId)}`;
+}
+function fetchUrlProxyEndpoint() {
+  const b = proxyBase();
+  return b ? `${b}/fetch-url` : null;
+}
+
+// ---------- credential persistence ----------
 
 function loadCreds() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return;
-    const data = JSON.parse(raw);
-    if (data.authToken) els.authToken.value = data.authToken;
-    if (data.tokenSavedAt) {
-      const ageDays = (Date.now() - data.tokenSavedAt) / 86_400_000;
-      const stamp = new Date(data.tokenSavedAt).toLocaleString();
+    const d = JSON.parse(raw);
+    if (d.authToken) els.authToken.value = d.authToken;
+    if (d.proxyUrl && els.proxyUrl) els.proxyUrl.value = d.proxyUrl;
+    if (d.tokenSavedAt) {
+      const ageDays = (Date.now() - d.tokenSavedAt) / 86_400_000;
       const warn = ageDays >= 5;
       els.tokenMeta.textContent =
-        `Token saved ${ageDays.toFixed(1)} days ago (${stamp}).` +
-        (warn ? " Spyne tokens typically expire after 5–6 days; if downloads fail with 401, paste a fresh one." : "");
+        `Token saved ${ageDays.toFixed(1)} days ago (${new Date(d.tokenSavedAt).toLocaleString()}).` +
+        (warn ? " May be expired — paste a fresh one if you see 401 errors." : "");
       els.tokenMeta.style.color = warn ? "var(--warn)" : "";
     }
-  } catch (e) {
-    console.warn("Could not load saved credentials:", e);
-  }
+  } catch (e) { console.warn("loadCreds:", e); }
 }
 
 function saveCreds() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      authToken: els.authToken.value.trim(),
+      authToken:    els.authToken.value.trim(),
+      proxyUrl:     els.proxyUrl?.value.trim() || "",
       tokenSavedAt: Date.now(),
     }));
-  } catch (e) {
-    console.warn("Could not save credentials:", e);
-  }
+  } catch (e) { console.warn("saveCreds:", e); }
 }
 
 function clearCreds() {
   localStorage.removeItem(STORAGE_KEY);
   els.authToken.value = "";
+  if (els.proxyUrl) els.proxyUrl.value = "";
   els.tokenMeta.textContent = "";
-  log("Cleared saved token.", "warn");
+  log("Cleared saved token and proxy URL.", "warn");
 }
 
 // ---------- CSV parsing ----------
 
-/** Tiny CSV parser — handles quoted fields and commas inside quotes. */
 function parseCSV(text) {
   const rows = [];
-  let row = [], field = "", inQuotes = false;
+  let row = [], field = "", inQ = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
-    if (inQuotes) {
-      if (c === '"' && text[i + 1] === '"') { field += '"'; i++; }
-      else if (c === '"') inQuotes = false;
+    if (inQ) {
+      if (c === '"' && text[i+1] === '"') { field += '"'; i++; }
+      else if (c === '"') inQ = false;
       else field += c;
     } else {
-      if (c === '"') inQuotes = true;
-      else if (c === ",") { row.push(field); field = ""; }
-      else if (c === "\r") { /* skip */ }
-      else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+      if (c === '"') inQ = true;
+      else if (c === ',') { row.push(field); field = ""; }
+      else if (c === '\r') { /* skip */ }
+      else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ""; }
       else field += c;
     }
   }
   if (field.length || row.length) { row.push(field); rows.push(row); }
-  return rows.filter((r) => r.some((c) => c && c.trim() !== ""));
+  return rows.filter(r => r.some(c => c && c.trim()));
 }
 
-const MEDIA_ID_HEADERS     = ["media id", "mediaid", "media_id", "mediaids", "media ids"];
-const VIN_HEADERS          = ["vin", "sku name", "sku", "vin name"];
-const ENTERPRISE_ID_HEADERS = ["enterprise id", "enterpriseid", "enterprise_id", "enterprise"];
-const TEAM_ID_HEADERS      = ["team id", "teamid", "team_id", "team"];
-const USER_ID_HEADERS      = ["user id", "userid", "user_id", "user"];
+const HDR_MEDIA      = ["media id","mediaid","media_id","mediaids","media ids"];
+const HDR_VIN        = ["vin","sku name","sku","vin name"];
+const HDR_ENTERPRISE = ["enterprise id","enterpriseid","enterprise_id","enterprise"];
+const HDR_TEAM       = ["team id","teamid","team_id","team"];
+const HDR_USER       = ["user id","userid","user_id","user"];
 
-function findHeaderIndex(headers, candidates) {
-  const norm = (s) => s.toLowerCase().trim();
-  for (let i = 0; i < headers.length; i++) {
+function hdrIdx(headers, candidates) {
+  const norm = s => s.toLowerCase().trim();
+  for (let i = 0; i < headers.length; i++)
     if (candidates.includes(norm(headers[i]))) return i;
-  }
   return -1;
 }
 
@@ -130,255 +152,223 @@ function loadCSVFile(file) {
   reader.onload = () => {
     try {
       const rows = parseCSV(reader.result);
-      if (rows.length < 2) {
-        log("CSV must have a header row and at least one data row.", "err");
-        parsedRows = [];
-        return;
-      }
-      const headers = rows[0];
-      const mediaIdx = findHeaderIndex(headers, MEDIA_ID_HEADERS);
-      const vinIdx   = findHeaderIndex(headers, VIN_HEADERS);
-      const eidIdx   = findHeaderIndex(headers, ENTERPRISE_ID_HEADERS);
-      const tidIdx   = findHeaderIndex(headers, TEAM_ID_HEADERS);
-      const uidIdx   = findHeaderIndex(headers, USER_ID_HEADERS);
-
-      // Media ID column is required.
-      if (mediaIdx === -1) {
-        log(
-          `CSV is missing a Media ID column. Expected one of: ${MEDIA_ID_HEADERS.join(", ")}. ` +
-          `Found: ${headers.join(", ")}`,
-          "err"
-        );
-        parsedRows = [];
-        return;
-      }
-
-      // Enterprise ID and Team ID columns are required.
-      if (eidIdx === -1) {
-        log(
-          `CSV is missing an Enterprise ID column. Expected one of: ${ENTERPRISE_ID_HEADERS.join(", ")}. ` +
-          `Found: ${headers.join(", ")}`,
-          "err"
-        );
-        parsedRows = [];
-        return;
-      }
-      if (tidIdx === -1) {
-        log(
-          `CSV is missing a Team ID column. Expected one of: ${TEAM_ID_HEADERS.join(", ")}. ` +
-          `Found: ${headers.join(", ")}`,
-          "err"
-        );
-        parsedRows = [];
-        return;
-      }
+      if (rows.length < 2) { log("CSV needs a header + at least one data row.", "err"); parsedRows = []; return; }
+      const H = rows[0];
+      const mi = hdrIdx(H, HDR_MEDIA);
+      const vi = hdrIdx(H, HDR_VIN);
+      const ei = hdrIdx(H, HDR_ENTERPRISE);
+      const ti = hdrIdx(H, HDR_TEAM);
+      const ui = hdrIdx(H, HDR_USER);
+      if (mi < 0) { log(`Missing Media ID column. Found: ${H.join(", ")}`, "err"); parsedRows = []; return; }
+      if (ei < 0) { log(`Missing Enterprise ID column. Found: ${H.join(", ")}`, "err"); parsedRows = []; return; }
+      if (ti < 0) { log(`Missing Team ID column. Found: ${H.join(", ")}`, "err"); parsedRows = []; return; }
 
       const seen = new Set();
       parsedRows = [];
-      const missingCreds = [];
-
+      const warn = [];
       for (let i = 1; i < rows.length; i++) {
-        const m  = (rows[i][mediaIdx] || "").trim();
+        const m = (rows[i][mi] || "").trim();
         if (!m || seen.has(m)) continue;
         seen.add(m);
-
-        const enterpriseId = (rows[i][eidIdx] || "").trim();
-        const teamId       = (rows[i][tidIdx] || "").trim();
-        const userId       = uidIdx >= 0 ? (rows[i][uidIdx] || "").trim() : "";
-
-        if (!enterpriseId || !teamId) {
-          missingCreds.push(`row ${i + 1} (${m})`);
-        }
-
-        parsedRows.push({
-          mediaId: m,
-          vin: vinIdx >= 0 ? (rows[i][vinIdx] || "").trim() : "",
-          enterpriseId,
-          teamId,
-          userId,
-        });
+        const eid = (rows[i][ei] || "").trim();
+        const tid = (rows[i][ti] || "").trim();
+        const uid = ui >= 0 ? (rows[i][ui] || "").trim() : "";
+        if (!eid || !tid) warn.push(`row ${i+1}`);
+        parsedRows.push({ mediaId: m, vin: vi >= 0 ? (rows[i][vi] || "").trim() : "", enterpriseId: eid, teamId: tid, userId: uid });
       }
+      if (warn.length) log(`${warn.length} row(s) missing Enterprise/Team ID: ${warn.slice(0,5).join(", ")}${warn.length>5?` +${warn.length-5} more`:""}`, "warn");
 
-      if (missingCreds.length) {
-        log(
-          `Warning: ${missingCreds.length} row(s) are missing Enterprise ID or Team ID: ` +
-          missingCreds.slice(0, 5).join(", ") +
-          (missingCreds.length > 5 ? ` … and ${missingCreds.length - 5} more.` : "."),
-          "warn"
-        );
-      }
-
-      const extras = [];
-      if (vinIdx >= 0) extras.push("VIN labels");
-      if (uidIdx >= 0) extras.push("User ID");
-
-      els.csvSummary.textContent =
-        `Loaded ${parsedRows.length} unique media ID${parsedRows.length === 1 ? "" : "s"} from ${file.name}` +
-        (extras.length ? ` (with ${extras.join(" and ")}).` : ".");
-
-      log(
-        `CSV parsed: ${parsedRows.length} rows — credentials read from CSV columns.`,
-        missingCreds.length ? "warn" : "ok"
-      );
-    } catch (e) {
-      log(`Failed to parse CSV: ${e.message}`, "err");
-      parsedRows = [];
-    }
+      const extras = [vi>=0&&"VIN labels", ui>=0&&"User ID"].filter(Boolean);
+      els.csvSummary.textContent = `Loaded ${parsedRows.length} unique media ID${parsedRows.length===1?"":"s"} from ${file.name}${extras.length?` (with ${extras.join(" and ")}).`:"."}`; 
+      log(`CSV parsed: ${parsedRows.length} rows.`, warn.length ? "warn" : "ok");
+    } catch(e) { log(`CSV parse error: ${e.message}`, "err"); parsedRows = []; }
   };
   reader.onerror = () => log("Could not read CSV file.", "err");
   reader.readAsText(file);
 }
 
-// ---------- output / logging ----------
+// ---------- logging ----------
 
 function log(msg, kind = "info") {
   els.outputCard.hidden = false;
-  const stamp = new Date().toLocaleTimeString();
-  const cls = kind === "ok" ? "row-ok" : kind === "err" ? "row-err" : kind === "warn" ? "row-warn" : "";
+  const cls = kind==="ok"?"row-ok":kind==="err"?"row-err":kind==="warn"?"row-warn":"";
   const line = document.createElement("div");
   if (cls) line.className = cls;
-  line.textContent = `[${stamp}] ${msg}`;
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
   els.output.appendChild(line);
   els.output.scrollTop = els.output.scrollHeight;
+}
+
+// ---------- folder picker ----------
+
+async function pickFolder() {
+  try {
+    downloadDirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+    els.folderStatus.textContent = `📁 Saving to: ${downloadDirHandle.name}`;
+    els.folderStatus.style.color = "var(--ok)";
+    log(`Output folder set: "${downloadDirHandle.name}"`, "ok");
+  } catch(e) {
+    if (e.name !== "AbortError") log(`Folder picker error: ${e.message}`, "err");
+  }
 }
 
 // ---------- API helpers ----------
 
 function buildPayload(row) {
   return {
-    userData: {
-      enterpriseId: row.enterpriseId,
-      teamId: row.teamId,
-      userId: row.userId || "",
-    },
+    userData: { enterpriseId: row.enterpriseId, teamId: row.teamId, userId: row.userId || "" },
     downloadRequestData: {
-      downloadType: els.downloadType.value,
-      formatType: els.formatType.value,
-      isSequence: els.isSequence.checked,
+      downloadType:    els.downloadType.value,
+      formatType:      els.formatType.value,
+      isSequence:      els.isSequence.checked,
       downloadProduct: [els.downloadProduct.value],
     },
   };
 }
 
-function newRequestId() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
-  });
+function newUUID() {
+  return (typeof crypto !== "undefined" && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
+        const r = Math.random()*16|0; return (c==="x"?r:(r&3)|8).toString(16);
+      });
 }
 
-function buildHeaders(token) {
+function apiHeaders(token) {
   return {
     accept: "application/json, text/plain, */*",
     authorization: token.startsWith("Bearer ") ? token : `Bearer ${token}`,
     "content-type": "application/json",
-    "x-request-id": newRequestId(),
+    "x-request-id": newUUID(),
   };
 }
 
-async function callPerVinPost(mediaId, payload, token) {
-  return fetch(PER_VIN_POST_URL(mediaId), {
-    method: "POST",
-    headers: buildHeaders(token),
-    body: JSON.stringify(payload),
-    mode: "cors",
-  });
+function extractDownloadUrl(json, preferredProduct) {
+  const products = json?.data?.products || json?.products;
+  if (products && typeof products === "object") {
+    const keys = preferredProduct && products[preferredProduct]
+      ? [preferredProduct, ...Object.keys(products).filter(k => k !== preferredProduct)]
+      : Object.keys(products);
+    for (const k of keys) {
+      const u = products[k]?.url || products[k]?.downloadUrl || products[k]?.signedUrl;
+      if (typeof u === "string" && u.startsWith("http")) return u;
+    }
+  }
+  return json?.data?.downloadUrl || json?.data?.url || json?.data?.signedUrl ||
+         json?.downloadUrl || json?.url || json?.signedUrl || null;
 }
 
-/** Save a Blob to disk via a hidden <a download>. */
 function saveBlob(blob, filename) {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
+  document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 30_000);
 }
 
-/** Sanitize a string for use as a filename/folder-name entry. */
-function safeFilename(name, fallback = "download") {
-  const cleaned = String(name || fallback).replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim();
-  return cleaned || fallback;
+function safeName(s, fb = "download") {
+  return (String(s || fb).replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim()) || fb;
 }
 
-/** Try to find a usable download URL anywhere in the API response. */
-function extractDownloadUrl(json, preferredProduct) {
-  const products = json?.data?.products || json?.products;
-  if (products && typeof products === "object") {
-    const orderedKeys = preferredProduct && products[preferredProduct]
-      ? [preferredProduct, ...Object.keys(products).filter((k) => k !== preferredProduct)]
-      : Object.keys(products);
-    for (const key of orderedKeys) {
-      const p = products[key] || {};
-      const purl = p.url || p.downloadUrl || p.signedUrl;
-      if (typeof purl === "string" && purl.startsWith("http")) return purl;
-    }
-  }
-  return (
-    json?.data?.downloadUrl ||
-    json?.data?.url ||
-    json?.data?.signedUrl ||
-    json?.downloadUrl ||
-    json?.url ||
-    json?.signedUrl ||
-    null
-  );
+async function writeBlobToFolder(blob, fname, label) {
+  const fh = await downloadDirHandle.getFileHandle(fname, { create: true });
+  const w  = await fh.createWritable();
+  await w.write(blob); await w.close();
+  log(`  ✓ ${label}: saved ${fname} (${(blob.size/1024/1024).toFixed(2)} MB) → ${downloadDirHandle.name}/`, "ok");
 }
 
 // ---------- master ZIP ----------
 
-// One JSZip instance is reused across the whole run.  Each VIN's ZIP blob is
-// added as an entry; when everything is done we generate one combined download.
 let masterZip = null;
 let masterZipEntries = 0;
 
-/** Fetch a signed URL and add the blob to masterZip under "{VIN}.zip".
- *  Falls back to window.open() if the fetch is blocked by CORS on the S3 URL.
+/**
+ * Fetch the blob for a signed URL.
+ * Tries proxy /fetch-url first (bypasses S3 CORS), falls back to direct fetch.
+ * Returns null if both fail.
  */
-async function deliverDownload(url, row, label) {
-  const entryName = `${safeFilename(row.vin || row.mediaId)}.zip`;
+async function fetchBlob(signedUrl) {
+  const proxyEndpoint = fetchUrlProxyEndpoint();
 
-  if (masterZip) {
+  // Try proxy first
+  if (proxyEndpoint) {
     try {
-      const res = await fetch(url, { mode: "cors" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const blob = await res.blob();
-      masterZip.file(entryName, blob);
-      masterZipEntries++;
-      log(`  ✓ ${label}: added ${entryName} (${(blob.size / 1024 / 1024).toFixed(2)} MB) to master ZIP.`, "ok");
-      return;
-    } catch (e) {
-      log(
-        `  Could not fetch ${entryName} for master ZIP (${e.message}). ` +
-        `Opening URL directly — browser will save it to your default Downloads folder.`,
-        "warn"
-      );
+      const res = await fetch(proxyEndpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url: signedUrl }),
+      });
+      if (!res.ok) throw new Error(`proxy HTTP ${res.status}`);
+      return await res.blob();
+    } catch(e) {
+      log(`  Proxy fetch failed (${e.message}). Trying direct…`, "warn");
     }
   }
-  window.open(url, "_blank", "noopener");
-  log(`  ✓ ${label}: download URL opened in a new tab.`, "ok");
+
+  // Try direct (will work if CORS allows, which it usually doesn't for S3 signed URLs)
+  try {
+    const res = await fetch(signedUrl, { mode: "cors" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.blob();
+  } catch(e) {
+    log(`  Direct fetch also failed (${e.message}).`, "warn");
+    return null;
+  }
+}
+
+/**
+ * Deliver one VIN's download.
+ *
+ * Priority:
+ *   1. Fetch blob (via proxy or direct) → add to master ZIP (if proxy set)
+ *   2. Fetch blob → write to chosen folder (if folder picker used)
+ *   3. Fetch blob → saveBlob to default Downloads
+ *   4. window.open fallback (when blob cannot be fetched)
+ */
+async function deliverDownload(signedUrl, row, label) {
+  const fname = `${safeName(row.vin || row.mediaId)}.zip`;
+  const blob  = await fetchBlob(signedUrl);
+
+  if (blob) {
+    // Mode A: proxy set → collect into master ZIP
+    if (proxyBase() && masterZip) {
+      masterZip.file(fname, blob);
+      masterZipEntries++;
+      log(`  ✓ ${label}: added ${fname} (${(blob.size/1024/1024).toFixed(2)} MB) to master ZIP.`, "ok");
+      return;
+    }
+
+    // Mode B: folder picker active → write directly to folder
+    if (downloadDirHandle) {
+      try { await writeBlobToFolder(blob, fname, label); return; }
+      catch(e) { log(`  Folder write failed (${e.message}). Saving to default Downloads.`, "warn"); }
+    }
+
+    // Mode C-blob: save to default Downloads (at least it's one click, not a tab)
+    saveBlob(blob, fname);
+    log(`  ✓ ${label}: saved ${fname} (${(blob.size/1024/1024).toFixed(2)} MB) to default Downloads.`, "ok");
+    return;
+  }
+
+  // Mode C-tab: cannot get bytes at all — open in tab
+  window.open(signedUrl, "_blank", "noopener");
+  log(`  ✓ ${label}: download URL opened in a new tab (browser default Downloads folder).`, "ok");
 }
 
 // ---------- per-VIN polling ----------
 
-const RESULT_DOWNLOADED = "downloaded";
-const RESULT_PENDING    = "pending";
-const RESULT_FAILED     = "failed";
+const R_DONE    = "downloaded";
+const R_PENDING = "pending";
+const R_FAILED  = "failed";
 
-async function fetchPerMediaDownload(row, requestId, token, { quiet = false } = {}) {
-  const url   = PER_MEDIA_URL(row.mediaId, requestId);
+async function fetchPerMedia(row, requestId, token, { quiet = false } = {}) {
   const label = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
-
-  const res = await fetch(url, {
+  const res = await fetch(perMediaGetUrl(row.mediaId, requestId), {
     method: "GET",
     headers: {
       accept: "application/json, text/plain, */*",
       authorization: token.startsWith("Bearer ") ? token : `Bearer ${token}`,
-      "x-request-id": newRequestId(),
+      "x-request-id": newUUID(),
     },
     mode: "cors",
   });
@@ -389,99 +379,82 @@ async function fetchPerMediaDownload(row, requestId, token, { quiet = false } = 
     const txt = await res.text().catch(() => res.statusText);
     if (res.status === 404 || res.status === 425 || /not.?ready|in[\s_-]?progress/i.test(txt)) {
       if (!quiet) log(`  ⋯ ${label}: still preparing (HTTP ${res.status}). Will retry.`, "warn");
-      return RESULT_PENDING;
+      return R_PENDING;
     }
-    log(`  ✗ ${label}: HTTP ${res.status} — ${txt.slice(0, 240)}`, "err");
-    return RESULT_FAILED;
+    log(`  ✗ ${label}: HTTP ${res.status} — ${txt.slice(0,240)}`, "err");
+    return R_FAILED;
   }
 
   if (ctype.includes("application/json")) {
     const json = await res.json().catch(() => null);
+    const PENDING = ["pending","in_progress","yet_to_start","queued","processing"];
     const overallStatus = (json?.data?.status || json?.status || "").toLowerCase();
     const products = json?.data?.products || json?.products;
-    const PENDING_STATES = ["pending", "in_progress", "yet_to_start", "queued", "processing"];
 
-    let downloadUrl = null;
-    let anyProductPending = false;
+    let downloadUrl = null, anyPending = false;
     if (products && typeof products === "object") {
-      const preferredKey = els.downloadProduct?.value;
-      const orderedKeys = preferredKey && products[preferredKey]
-        ? [preferredKey, ...Object.keys(products).filter((k) => k !== preferredKey)]
+      const preferred = els.downloadProduct?.value;
+      const keys = preferred && products[preferred]
+        ? [preferred, ...Object.keys(products).filter(k=>k!==preferred)]
         : Object.keys(products);
-      for (const key of orderedKeys) {
-        const p = products[key] || {};
-        const purl = p.url || p.downloadUrl || p.signedUrl;
-        if (typeof purl === "string" && purl.startsWith("http")) { downloadUrl = purl; break; }
-        if (PENDING_STATES.includes((p.status || "").toLowerCase())) anyProductPending = true;
+      for (const k of keys) {
+        const p = products[k] || {};
+        const u = p.url || p.downloadUrl || p.signedUrl;
+        if (typeof u === "string" && u.startsWith("http")) { downloadUrl = u; break; }
+        if (PENDING.includes((p.status||"").toLowerCase())) anyPending = true;
       }
     }
-    if (!downloadUrl) {
-      downloadUrl =
-        json?.data?.downloadUrl || json?.data?.url || json?.data?.signedUrl ||
-        json?.downloadUrl || json?.url || json?.signedUrl || null;
-    }
+    if (!downloadUrl) downloadUrl = extractDownloadUrl(json, els.downloadProduct?.value);
 
     if (typeof downloadUrl === "string" && downloadUrl.startsWith("http")) {
       await deliverDownload(downloadUrl, row, label);
-      return RESULT_DOWNLOADED;
+      return R_DONE;
     }
-    if (PENDING_STATES.includes(overallStatus) || anyProductPending) {
-      if (!quiet) log(`  ⋯ ${label}: still preparing (${overallStatus || "in_progress"}). Will retry.`, "warn");
-      return RESULT_PENDING;
+    if (PENDING.includes(overallStatus) || anyPending) {
+      if (!quiet) log(`  ⋯ ${label}: still preparing (${overallStatus||"in_progress"}). Will retry.`, "warn");
+      return R_PENDING;
     }
-    log(`  ! ${label}: unrecognised response shape — ${JSON.stringify(json).slice(0, 280)}`, "err");
-    return RESULT_FAILED;
+    log(`  ! ${label}: unrecognised response — ${JSON.stringify(json).slice(0,280)}`, "err");
+    return R_FAILED;
   }
 
-  // Binary response — treat as the file itself.
+  // Binary response — treat as the file itself
   const blob = await res.blob();
   const ext  = ctype.includes("zip") ? "zip" : "bin";
-  const fname = `${safeFilename(row.vin || row.mediaId)}.${ext}`;
-  if (masterZip) {
-    masterZip.file(fname, blob);
-    masterZipEntries++;
-    log(`  ✓ ${label}: added ${fname} (${(blob.size / 1024 / 1024).toFixed(2)} MB) to master ZIP.`, "ok");
-  } else {
-    saveBlob(blob, fname);
-    log(`  ✓ ${label}: saved ${fname} (${(blob.size / 1024 / 1024).toFixed(2)} MB).`, "ok");
+  const fname = `${safeName(row.vin || row.mediaId)}.${ext}`;
+  if (downloadDirHandle) {
+    try { await writeBlobToFolder(blob, fname, label); return R_DONE; }
+    catch(e) { log(`  Folder write failed (${e.message}). Falling back.`, "warn"); }
   }
-  return RESULT_DOWNLOADED;
+  if (masterZip && proxyBase()) {
+    masterZip.file(fname, blob); masterZipEntries++;
+    log(`  ✓ ${label}: added ${fname} (${(blob.size/1024/1024).toFixed(2)} MB) to master ZIP.`, "ok");
+    return R_DONE;
+  }
+  saveBlob(blob, fname);
+  log(`  ✓ ${label}: saved ${fname} (${(blob.size/1024/1024).toFixed(2)} MB) to default Downloads.`, "ok");
+  return R_DONE;
 }
 
-async function pollAndDownloadOne(row, requestId, token, idx, total) {
+async function pollOne(row, requestId, token, idx, total) {
   const label  = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
-  const prefix = `[${idx + 1}/${total}]`;
-  const startMs = Date.now();
-  let attempt = 0, backoffIdx = 0;
-
-  while (Date.now() - startMs < POLL_MAX_MS) {
+  const prefix = `[${idx+1}/${total}]`;
+  const t0 = Date.now(); let attempt = 0, bi = 0;
+  while (Date.now() - t0 < POLL_MAX_MS) {
     attempt++;
     if (attempt > 1) {
-      const wait = POLL_INTERVALS_MS[Math.min(backoffIdx, POLL_INTERVALS_MS.length - 1)];
-      log(`${prefix}   …still preparing (${((Date.now() - startMs) / 1000).toFixed(0)}s elapsed). Waiting ${(wait / 1000).toFixed(0)}s.`);
-      await new Promise((r) => setTimeout(r, wait));
+      const wait = POLL_INTERVALS_MS[Math.min(bi, POLL_INTERVALS_MS.length-1)];
+      log(`${prefix}   …still preparing (${((Date.now()-t0)/1000).toFixed(0)}s). Waiting ${wait/1000}s.`);
+      await new Promise(r => setTimeout(r, wait));
     }
-
     let result;
-    try {
-      result = await fetchPerMediaDownload(row, requestId, token, { quiet: attempt > 1 });
-    } catch (e) {
-      log(`${prefix}   ✗ ${label}: ${e.message}`, "err");
-      return false;
-    }
-
-    if (result === RESULT_DOWNLOADED) {
-      log(`${prefix}   ✓ ${label}: done after ${((Date.now() - startMs) / 1000).toFixed(1)}s.`, "ok");
-      return true;
-    }
-    if (result === RESULT_FAILED) {
-      log(`${prefix}   ✗ ${label}: hard failure — see above.`, "err");
-      return false;
-    }
-    backoffIdx++;
+    try { result = await fetchPerMedia(row, requestId, token, { quiet: attempt>1 }); }
+    catch(e) { log(`${prefix}   ✗ ${label}: ${e.message}`, "err"); return false; }
+    if (result === R_DONE) { log(`${prefix}   ✓ ${label}: done after ${((Date.now()-t0)/1000).toFixed(1)}s.`, "ok"); return true; }
+    if (result === R_FAILED) { log(`${prefix}   ✗ ${label}: hard failure.`, "err"); return false; }
+    bi++;
   }
-
-  log(`${prefix}   ⏱  ${label}: ${(POLL_MAX_MS / 60000).toFixed(0)}-min cap hit, still pending.`, "warn");
+  log(`${prefix}   ⏱  ${label}: polling cap hit, still pending.`, "warn");
   return false;
 }
 
@@ -492,35 +465,36 @@ let lastRequestIdsByMedia = new Map();
 
 // ---------- finalize master ZIP ----------
 
-async function finalizeMasterZip(label = "") {
-  if (!masterZip || masterZipEntries === 0) {
-    if (masterZip) {
-      log(
-        "No VINs were added to the master ZIP — every fetch fell back to a tab. " +
-        "If this is CORS-related, deploy the Cloudflare Worker proxy (see README).",
-        "warn"
-      );
-    }
-    masterZip = null;
-    masterZipEntries = 0;
-    return;
+async function finalizeMasterZip() {
+  if (!masterZip) return;
+  if (masterZipEntries === 0) {
+    log("No VINs were collected into the master ZIP. Check proxy URL and try again.", "warn");
+    masterZip = null; return;
   }
-
-  log(`Building master ZIP with ${masterZipEntries} VIN${masterZipEntries === 1 ? "" : "s"}…`);
+  log(`Building master ZIP with ${masterZipEntries} VIN${masterZipEntries===1?"":"s"}…`);
   try {
     const blob = await masterZip.generateAsync({ type: "blob", compression: "STORE" });
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const stamp = new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
     const filename = `spyne-downloads-${stamp}.zip`;
     saveBlob(blob, filename);
-    log(`✓ Master ZIP saved: ${filename} (${(blob.size / 1024 / 1024).toFixed(2)} MB).${label}`, "ok");
-  } catch (e) {
-    log(`Could not build master ZIP: ${e.message}`, "err");
-  }
-  masterZip = null;
-  masterZipEntries = 0;
+    log(`✓ Master ZIP saved: ${filename} (${(blob.size/1024/1024).toFixed(2)} MB, ${masterZipEntries} VINs).`, "ok");
+  } catch(e) { log(`Could not build master ZIP: ${e.message}`, "err"); }
+  masterZip = null; masterZipEntries = 0;
 }
 
-// ---------- main download flow ----------
+// ---------- mode announcement ----------
+
+function announceMode() {
+  if (proxyBase()) {
+    log(`Mode: PROXY → master ZIP  [${proxyBase()}]`, "ok");
+  } else if (downloadDirHandle) {
+    log(`Mode: FOLDER PICKER → writing to "${downloadDirHandle.name}/"`, "ok");
+  } else {
+    log(`Mode: TAB FALLBACK — files go to default Downloads. Set a proxy URL (Option A) or choose a folder (Option B) above to control the destination.`, "warn");
+  }
+}
+
+// ---------- main flow ----------
 
 async function onDownloadClick() {
   els.output.innerHTML = "";
@@ -529,159 +503,115 @@ async function onDownloadClick() {
   const token = els.authToken.value.trim();
   if (!token) return log("Authorization token is required.", "err");
   if (!parsedRows.length) return log("Upload a CSV with at least one media ID.", "err");
-
-  // Validate that every row has credentials.
-  const badRows = parsedRows.filter((r) => !r.enterpriseId || !r.teamId);
-  if (badRows.length) {
-    return log(
-      `${badRows.length} row(s) are missing Enterprise ID or Team ID. ` +
-      `Please fix the CSV and re-upload.`,
-      "err"
-    );
-  }
+  const bad = parsedRows.filter(r => !r.enterpriseId || !r.teamId);
+  if (bad.length) return log(`${bad.length} row(s) missing Enterprise/Team ID. Fix CSV and re-upload.`, "err");
 
   saveCreds();
   lastRows = parsedRows.slice();
   lastRequestIdsByMedia = new Map();
 
-  if (typeof JSZip === "function") {
-    masterZip = new JSZip();
-    masterZipEntries = 0;
-  } else {
-    masterZip = null;
-    log("JSZip didn't load (CDN blocked?). Falling back to one tab per VIN.", "warn");
-  }
+  // Init master ZIP only when proxy is set (otherwise blob fetch will fail)
+  masterZip = (proxyBase() && typeof JSZip === "function") ? new JSZip() : null;
+  masterZipEntries = 0;
+  if (proxyBase() && !masterZip) log("JSZip didn't load (CDN blocked?). Blobs will be saved individually.", "warn");
 
-  log(
-    `Processing ${parsedRows.length} VIN${parsedRows.length === 1 ? "" : "s"} ` +
-    `sequentially` +
-    (masterZip ? ` — will bundle all into one master ZIP.` : `.`)
-  );
+  announceMode();
+  log(`Processing ${parsedRows.length} VIN${parsedRows.length===1?"":"s"} sequentially…`);
 
   els.downloadBtn.disabled = true;
   els.refetchBtn.hidden = false;
-  const startMs = Date.now();
-  let succeeded = 0, failed = 0;
+  const t0 = Date.now(); let ok = 0, fail = 0;
 
   try {
     for (let i = 0; i < parsedRows.length; i++) {
-      const row   = parsedRows[i];
+      const row = parsedRows[i];
       const label = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
-      const tag   = `[${i + 1}/${parsedRows.length}]`;
+      const tag   = `[${i+1}/${parsedRows.length}]`;
       log(`${tag} POST /medias/${row.mediaId}/download …`);
 
       try {
-        const payload = buildPayload(row);
-        const postRes = await callPerVinPost(row.mediaId, payload, token);
+        const postRes = await fetch(perVinPostUrl(row.mediaId), {
+          method: "POST",
+          headers: apiHeaders(token),
+          body: JSON.stringify(buildPayload(row)),
+          mode: "cors",
+        });
 
         if (!postRes.ok) {
-          const text = await postRes.text().catch(() => postRes.statusText);
-          log(`${tag}   ✗ POST HTTP ${postRes.status} — ${text.slice(0, 240)}`, "err");
-          failed++;
+          const txt = await postRes.text().catch(() => postRes.statusText);
+          log(`${tag}   ✗ POST HTTP ${postRes.status} — ${txt.slice(0,240)}`, "err"); fail++;
         } else {
           const json = await postRes.json().catch(() => null);
           const directUrl = extractDownloadUrl(json, els.downloadProduct.value);
 
           if (typeof directUrl === "string" && directUrl.startsWith("http")) {
-            await deliverDownload(directUrl, row, label);
-            succeeded++;
+            await deliverDownload(directUrl, row, label); ok++;
           } else {
-            const requestId =
-              json?.data?.requestId || json?.requestId || json?.jobId || json?.data?.jobId;
+            const requestId = json?.data?.requestId || json?.requestId || json?.jobId || json?.data?.jobId;
             if (!requestId) {
-              log(`${tag}   ✗ ${label}: POST returned neither URL nor requestId. Body: ${JSON.stringify(json).slice(0, 240)}`, "err");
-              failed++;
+              log(`${tag}   ✗ ${label}: no URL nor requestId. Body: ${JSON.stringify(json).slice(0,240)}`, "err"); fail++;
             } else {
               lastRequestIdsByMedia.set(row.mediaId, requestId);
-              log(`${tag}   POST accepted (requestId ${requestId}). Polling status…`);
-              const ok = await pollAndDownloadOne(row, requestId, token, i, parsedRows.length);
-              if (ok) succeeded++; else failed++;
+              log(`${tag}   POST accepted (requestId ${requestId}). Polling…`);
+              const done = await pollOne(row, requestId, token, i, parsedRows.length);
+              if (done) ok++; else fail++;
             }
           }
         }
-      } catch (e) {
-        if (e.message?.includes("Failed to fetch") || e.name === "TypeError") {
-          log(`${tag}   ✗ Network/CORS error. See README → CORS proxy setup.`, "err");
-        } else {
-          log(`${tag}   ✗ ${e.message}`, "err");
-        }
-        failed++;
+      } catch(e) {
+        log(`${tag}   ✗ ${e.message?.includes("Failed to fetch") ? "Network/CORS error. See README → proxy setup." : e.message}`, "err");
+        fail++;
       }
 
-      if (i < parsedRows.length - 1) {
-        await new Promise((r) => setTimeout(r, SEQUENTIAL_DELAY_MS));
-      }
+      if (i < parsedRows.length - 1) await new Promise(r => setTimeout(r, SEQUENTIAL_DELAY));
     }
-  } finally {
-    els.downloadBtn.disabled = false;
-  }
+  } finally { els.downloadBtn.disabled = false; }
 
-  const totalSec = ((Date.now() - startMs) / 1000).toFixed(1);
-  log(
-    `All VINs processed in ${totalSec}s — Success: ${succeeded}  Failed: ${failed}`,
-    failed ? "warn" : "ok"
-  );
-
-  await finalizeMasterZip(` Contains ${succeeded} VIN${succeeded === 1 ? "" : "s"}.`);
+  log(`Done in ${((Date.now()-t0)/1000).toFixed(1)}s — Success: ${ok}  Failed: ${fail}`, fail ? "warn" : "ok");
+  await finalizeMasterZip();
 }
 
-// ---------- re-fetch flow ----------
-
 async function onRefetchClick() {
-  if (!lastRequestIdsByMedia.size || !lastRows.length) {
-    log("No previous run to re-fetch. Click Download first.", "warn");
-    return;
-  }
+  if (!lastRequestIdsByMedia.size) { log("No previous run to re-fetch. Click Download first.", "warn"); return; }
   const token = els.authToken.value.trim();
   if (!token) return log("Authorization token is required.", "err");
 
-  if (typeof JSZip === "function") {
-    masterZip = new JSZip();
-    masterZipEntries = 0;
-  } else {
-    masterZip = null;
-  }
+  masterZip = (proxyBase() && typeof JSZip === "function") ? new JSZip() : null;
+  masterZipEntries = 0;
 
   els.refetchBtn.disabled = true;
-  const startMs = Date.now();
-  let succeeded = 0, failed = 0;
-
+  const t0 = Date.now(); let ok = 0, fail = 0;
   try {
-    log(`Re-fetching ${lastRows.length} VIN${lastRows.length === 1 ? "" : "s"} using saved request IDs…`);
+    log(`Re-fetching ${lastRows.length} VIN${lastRows.length===1?"":"s"}…`);
     for (let i = 0; i < lastRows.length; i++) {
       const row = lastRows[i];
-      const requestId = lastRequestIdsByMedia.get(row.mediaId);
-      if (!requestId) {
-        log(`[${i + 1}/${lastRows.length}]   ✗ No saved requestId for ${row.mediaId}; click Download to start fresh.`, "err");
-        failed++;
-        continue;
-      }
-      log(`[${i + 1}/${lastRows.length}] Re-checking ${row.mediaId}${row.vin ? ` (VIN ${row.vin})` : ""}…`);
-      const ok = await pollAndDownloadOne(row, requestId, token, i, lastRows.length);
-      if (ok) succeeded++; else failed++;
-      if (i < lastRows.length - 1) {
-        await new Promise((r) => setTimeout(r, SEQUENTIAL_DELAY_MS));
-      }
+      const rid = lastRequestIdsByMedia.get(row.mediaId);
+      if (!rid) { log(`[${i+1}/${lastRows.length}]   ✗ No requestId for ${row.mediaId}.`, "err"); fail++; continue; }
+      log(`[${i+1}/${lastRows.length}] Re-checking ${row.mediaId}${row.vin?` (VIN ${row.vin})`:""}…`);
+      const done = await pollOne(row, rid, token, i, lastRows.length);
+      if (done) ok++; else fail++;
+      if (i < lastRows.length - 1) await new Promise(r => setTimeout(r, SEQUENTIAL_DELAY));
     }
-  } finally {
-    els.refetchBtn.disabled = false;
-  }
+  } finally { els.refetchBtn.disabled = false; }
 
-  const totalSec = ((Date.now() - startMs) / 1000).toFixed(1);
-  log(`Re-fetch done in ${totalSec}s — Success: ${succeeded}  Failed: ${failed}`, failed ? "warn" : "ok");
-
-  await finalizeMasterZip(` Contains ${succeeded} VIN${succeeded === 1 ? "" : "s"}.`);
+  log(`Re-fetch done in ${((Date.now()-t0)/1000).toFixed(1)}s — Success: ${ok}  Failed: ${fail}`, fail ? "warn" : "ok");
+  await finalizeMasterZip();
 }
 
 // ---------- wire up ----------
 
 document.addEventListener("DOMContentLoaded", () => {
   loadCreds();
-  els.csvFile.addEventListener("change", (e) => {
-    const f = e.target.files?.[0];
-    if (f) loadCSVFile(f);
-  });
+
+  // Hide folder picker if browser doesn't support it
+  if (!("showDirectoryPicker" in window)) {
+    if (els.pickFolderBtn) els.pickFolderBtn.hidden = true;
+    if (els.folderUnsupported) els.folderUnsupported.hidden = false;
+  }
+
+  els.csvFile.addEventListener("change", e => { const f = e.target.files?.[0]; if (f) loadCSVFile(f); });
   els.downloadBtn.addEventListener("click", onDownloadClick);
-  if (els.refetchBtn) els.refetchBtn.addEventListener("click", onRefetchClick);
+  if (els.refetchBtn)    els.refetchBtn.addEventListener("click", onRefetchClick);
   els.clearCredsBtn.addEventListener("click", clearCreds);
+  if (els.pickFolderBtn) els.pickFolderBtn.addEventListener("click", pickFolder);
 });
