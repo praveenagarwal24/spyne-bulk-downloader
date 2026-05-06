@@ -31,7 +31,7 @@
         <small id="token-meta" class="muted"></small>
       </label>
 
-      <div class="row">
+      <div class="row" id="creds-row">
         <label>
           <span>Enterprise ID</span>
           <input id="enterprise-id" placeholder="e.g. 82255fce5" autocomplete="off" />
@@ -47,16 +47,22 @@
           <input id="user-id" placeholder="leave blank if unsure" autocomplete="off" />
         </label>
       </div>
+
+      <p id="creds-from-csv-msg" class="muted" hidden>
+        ✓ Enterprise / Team / User IDs are coming from your CSV — no need to type them here.
+      </p>
     </section>
 
     <section class="card">
       <h2>2. Media IDs (CSV upload)</h2>
       <p class="hint">
         CSV must contain a column named <code>Media ID</code> (case-insensitive; also accepts
-        <code>mediaId</code>, <code>media_id</code>). Optional columns: <code>VIN</code> /
-        <code>Sku Name</code> for human-readable labels, plus
+        <code>mediaId</code>, <code>media_id</code>). Each Media ID must be a real
+        24-character Spyne ObjectId (e.g. <code>69f53edf315b2a8070388552</code>) —
+        you can grab them from <code>console.spyne.ai</code>'s DevTools → Network tab.
+        Optional columns: <code>VIN</code> / <code>Sku Name</code> for labels, plus
         <code>Enterprise ID</code>, <code>Team ID</code>, <code>User ID</code> to
-        override the credentials in section 1 on a per-row basis.
+        provide credentials per-row (the form fields above will hide automatically).
       </p>
 
       <input type="file" id="csv-file" accept=".csv,text/csv" />
