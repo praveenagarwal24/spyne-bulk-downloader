@@ -392,14 +392,16 @@ async function deliverDownload(signedUrl, row, label) {
   const fname = `${safeName(row.vin || row.mediaId)}.zip`;
   const blob  = await fetchBlob(signedUrl);
   if (blob) {
-    if (proxyBase() && masterZip) {
-      await addToMasterZip(fname, blob, row);
-      log(`  ✓ ${label}: added to master ZIP under ${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/images/`, "ok");
-      return;
-    }
+    // Mode B: folder picker active — always takes priority (proxy just fetches the blob)
     if (downloadDirHandle) {
       try { await writeBlobToFolder(blob, fname, label, row); return; }
       catch(e) { log(`  Folder write failed (${e.message}). Saving to default Downloads.`, "warn"); }
+    }
+    // Mode A: proxy set, no folder picker — collect into master ZIP
+    if (proxyBase() && masterZip) {
+      await addToMasterZip(fname, blob, row);
+      log(`  ✓ ${label}: added to master ZIP under ${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/`, "ok");
+      return;
     }
     saveBlob(blob, fname);
     log(`  ✓ ${label}: saved ${fname} (${(blob.size/1024/1024).toFixed(2)} MB) to default Downloads.`, "ok");
@@ -473,13 +475,15 @@ async function fetchPerMedia(row, requestId, token, { quiet = false } = {}) {
   const blob = await res.blob();
   const ext  = ctype.includes("zip") ? "zip" : "bin";
   const fname = `${safeName(row.vin || row.mediaId)}.${ext}`;
+  // Mode B first
   if (downloadDirHandle) {
     try { await writeBlobToFolder(blob, fname, label, row); return R_DONE; }
     catch(e) { log(`  Folder write failed (${e.message}). Falling back.`, "warn"); }
   }
+  // Mode A
   if (masterZip && proxyBase()) {
     await addToMasterZip(fname, blob, row);
-    log(`  ✓ ${label}: added to master ZIP under ${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/images/`, "ok");
+    log(`  ✓ ${label}: added to master ZIP under ${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/`, "ok");
     return R_DONE;
   }
   saveBlob(blob, fname);
@@ -551,9 +555,15 @@ async function finalizeMasterZip() {
 
 function announceMode(concurrency) {
   const cStr = `(${concurrency} parallel)`;
-  if (proxyBase())          log(`Mode: PROXY → master ZIP  [${proxyBase()}]  ${cStr}`, "ok");
-  else if (downloadDirHandle) log(`Mode: FOLDER PICKER → "${downloadDirHandle.name}/"  ${cStr}`, "ok");
-  else                      log(`Mode: TAB FALLBACK — files go to default Downloads. Set a proxy URL or choose a folder above to control the destination.  ${cStr}`, "warn");
+  if (downloadDirHandle && proxyBase()) {
+    log(`Mode: PROXY (fetch) + FOLDER PICKER (save) → "${downloadDirHandle.name}/"  ${cStr}`, "ok");
+  } else if (downloadDirHandle) {
+    log(`Mode: FOLDER PICKER → "${downloadDirHandle.name}/"  ${cStr} — ⚠ No proxy set; S3 CORS may block downloads.`, "warn");
+  } else if (proxyBase()) {
+    log(`Mode: PROXY → master ZIP  [${proxyBase()}]  ${cStr}`, "ok");
+  } else {
+    log(`Mode: TAB FALLBACK — files go to default Downloads. Set a proxy URL or choose a folder above.  ${cStr}`, "warn");
+  }
 }
 
 // ---------- process one VIN ----------
