@@ -391,24 +391,30 @@ async function fetchBlob(signedUrl) {
 async function deliverDownload(signedUrl, row, label) {
   const fname = `${safeName(row.vin || row.mediaId)}.zip`;
   const blob  = await fetchBlob(signedUrl);
-  if (blob) {
-    // Mode B: folder picker active — always takes priority (proxy just fetches the blob)
-    if (downloadDirHandle) {
-      try { await writeBlobToFolder(blob, fname, label, row); return; }
-      catch(e) { log(`  Folder write failed (${e.message}). Saving to default Downloads.`, "warn"); }
-    }
-    // Mode A: proxy set, no folder picker — collect into master ZIP
-    if (proxyBase() && masterZip) {
-      await addToMasterZip(fname, blob, row);
-      log(`  ✓ ${label}: added to master ZIP under ${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/`, "ok");
-      return;
-    }
-    saveBlob(blob, fname);
-    log(`  ✓ ${label}: saved ${fname} (${(blob.size/1024/1024).toFixed(2)} MB) to default Downloads.`, "ok");
+
+  if (!blob) {
+    // Cannot fetch bytes — open in tab as last resort
+    window.open(signedUrl, "_blank", "noopener");
+    log(`  ⚠ ${label}: could not fetch blob (no proxy?). Opened in tab instead.`, "warn");
     return;
   }
-  window.open(signedUrl, "_blank", "noopener");
-  log(`  ✓ ${label}: download URL opened in a new tab (browser default Downloads folder).`, "ok");
+
+  // Always try to add to master ZIP with nested structure (proxy mode)
+  if (masterZip) {
+    await addToMasterZip(fname, blob, row);
+    log(`  ✓ ${label}: queued → ${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/`, "ok");
+    return;
+  }
+
+  // Folder picker active
+  if (downloadDirHandle) {
+    try { await writeBlobToFolder(blob, fname, label, row); return; }
+    catch(e) { log(`  Folder write failed (${e.message}). Saving flat.`, "warn"); }
+  }
+
+  // Last resort: flat save to default Downloads
+  saveBlob(blob, fname);
+  log(`  ✓ ${label}: saved ${fname} (${(blob.size/1024/1024).toFixed(2)} MB) to default Downloads.`, "ok");
 }
 
 // ---------- per-VIN polling ----------
@@ -538,7 +544,7 @@ let lastRequestIdsByMedia = new Map();
 async function finalizeMasterZip() {
   if (!masterZip) return;
   if (masterZipEntries === 0) {
-    log("No VINs were collected into the master ZIP. Check proxy URL and try again.", "warn");
+    log("No files were collected. Check your proxy URL and auth token.", "warn");
     masterZip = null; return;
   }
   log(`Building master ZIP with ${masterZipEntries} VIN${masterZipEntries===1?"":"s"}…`);
@@ -619,9 +625,9 @@ async function onDownloadClick() {
   lastRows = parsedRows.slice();
   lastRequestIdsByMedia = new Map();
   zipMutex = Promise.resolve();
-  masterZip = (proxyBase() && typeof JSZip === "function") ? new JSZip() : null;
+  masterZip = (typeof JSZip === "function") ? new JSZip() : null;
   masterZipEntries = 0;
-  if (proxyBase() && !masterZip) log("JSZip didn't load (CDN blocked?). Blobs will be saved individually.", "warn");
+  if (!masterZip) log("JSZip didn't load (CDN blocked?). Blobs will be saved individually.", "warn");
 
   const concurrency = getConcurrency();
   announceMode(concurrency);
@@ -656,7 +662,7 @@ async function onRefetchClick() {
   if (!token) return log("Authorization token is required.", "err");
 
   zipMutex = Promise.resolve();
-  masterZip = (proxyBase() && typeof JSZip === "function") ? new JSZip() : null;
+  masterZip = (typeof JSZip === "function") ? new JSZip() : null;
   masterZipEntries = 0;
 
   const concurrency = getConcurrency();
