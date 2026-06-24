@@ -1,28 +1,23 @@
 /* Spyne Bulk Media Downloader — front-end logic.
- * Enterprise ID, Team ID, User ID come exclusively from the CSV.
  *
- * DOWNLOAD STRATEGY (three modes, auto-selected at runtime):
+ * DOWNLOAD MODES (selected automatically based on what you've configured):
  *
- *  Mode A — PROXY + master ZIP
- *  Mode B — FOLDER PICKER  (no proxy needed)
- *  Mode C — TAB FALLBACK
+ *  FOLDER mode  — folder picked → each VIN's images extracted into  folder/enterpriseId/teamId/VIN/
+ *  ZIP mode     — proxy URL set, no folder → all VINs bundled into one master ZIP download
+ *  TAB mode     — neither set → each VIN opens in a new browser tab
  *
- * SPEED UPGRADE v2:
- *  - Parallel concurrency: CONCURRENCY VINs processed simultaneously (default 5).
- *  - Each VIN's poll loop runs independently — no VIN blocks another.
- *  - First poll delay reduced to 1 s (API often resolves quickly).
- *  - Sequential 1 s inter-VIN delay removed entirely.
- *  - Real-time progress bar.
+ * The proxy URL is always needed to fetch blobs (S3 CORS blocks direct browser requests).
+ * The folder picker controls WHERE the fetched blobs land.
  */
 
-const STORAGE_KEY = "spyne-bulk-downloader/v3";
-
-const POLL_INTERVALS_MS = [1_000, 3_000, 5_000, 10_000, 15_000, 30_000];
-const POLL_MAX_MS       = 15 * 60 * 1000;
+const STORAGE_KEY         = "spyne-bulk-downloader/v3";
+const POLL_INTERVALS_MS   = [1_000, 3_000, 5_000, 10_000, 15_000, 30_000];
+const POLL_MAX_MS         = 15 * 60 * 1000;
 const DEFAULT_CONCURRENCY = 5;
 
 const $ = (id) => document.getElementById(id);
 
+// Grab all UI elements once at startup
 const els = {
   authToken:         $("auth-token"),
   tokenMeta:         $("token-meta"),
@@ -47,18 +42,29 @@ const els = {
   progressWrap:      $("progress-wrap"),
 };
 
-let parsedRows        = [];
-let downloadDirHandle = null;
+// Global state
+let parsedRows        = [];   // rows parsed from CSV
+let downloadDirHandle = null; // FileSystemDirectoryHandle when folder picker used
+let masterZip         = null; // JSZip instance for ZIP mode
+let masterZipEntries  = 0;
+let zipMutex          = Promise.resolve();
+let lastRows          = [];
+let lastRequestIdsByMedia = new Map();
 
-// ---------- config ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// Config helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 function proxyBase() {
   return (els.proxyUrl?.value || "").trim().replace(/\/$/, "");
 }
+
 function getConcurrency() {
   const v = parseInt(els.concurrency?.value, 10);
   return (!isNaN(v) && v >= 1 && v <= 20) ? v : DEFAULT_CONCURRENCY;
 }
+
+// Use proxy for API calls if proxy URL is set, otherwise call Spyne directly
 function perVinPostUrl(mediaId) {
   const b = proxyBase();
   return b ? `${b}/medias/${encodeURIComponent(mediaId)}/download`
@@ -74,18 +80,27 @@ function fetchUrlProxyEndpoint() {
   return b ? `${b}/fetch-url` : null;
 }
 
-// ---------- credentials ----------
+// Which mode are we in right now?
+function getMode() {
+  if (downloadDirHandle) return "FOLDER";   // folder picked → save there
+  if (proxyBase())       return "ZIP";      // proxy set, no folder → master ZIP
+  return "TAB";                             // nothing set → open tabs
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Credentials (localStorage)
+// ─────────────────────────────────────────────────────────────────────────────
 
 function loadCreds() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return;
     const d = JSON.parse(raw);
-    if (d.authToken) els.authToken.value = d.authToken;
-    if (d.proxyUrl && els.proxyUrl) els.proxyUrl.value = d.proxyUrl;
+    if (d.authToken && els.authToken) els.authToken.value = d.authToken;
+    if (d.proxyUrl  && els.proxyUrl)  els.proxyUrl.value  = d.proxyUrl;
     if (d.tokenSavedAt) {
       const ageDays = (Date.now() - d.tokenSavedAt) / 86_400_000;
-      const warn = ageDays >= 5;
+      const warn    = ageDays >= 5;
       els.tokenMeta.textContent =
         `Token saved ${ageDays.toFixed(1)} days ago (${new Date(d.tokenSavedAt).toLocaleString()}).` +
         (warn ? " May be expired — paste a fresh one if you see 401 errors." : "");
@@ -112,7 +127,9 @@ function clearCreds() {
   log("Cleared saved token and proxy URL.", "warn");
 }
 
-// ---------- CSV ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// CSV parsing
+// ─────────────────────────────────────────────────────────────────────────────
 
 function parseCSV(text) {
   const rows = [];
@@ -154,7 +171,7 @@ function loadCSVFile(file) {
     try {
       const rows = parseCSV(reader.result);
       if (rows.length < 2) { log("CSV needs a header + at least one data row.", "err"); parsedRows = []; return; }
-      const H = rows[0];
+      const H  = rows[0];
       const mi = hdrIdx(H, HDR_MEDIA), vi = hdrIdx(H, HDR_VIN);
       const ei = hdrIdx(H, HDR_ENTERPRISE), ti = hdrIdx(H, HDR_TEAM), ui = hdrIdx(H, HDR_USER);
       if (mi < 0) { log(`Missing Media ID column. Found: ${H.join(", ")}`, "err"); parsedRows = []; return; }
@@ -180,19 +197,19 @@ function loadCSVFile(file) {
   reader.readAsText(file);
 }
 
-// ---------- logging ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// Logging & progress
+// ─────────────────────────────────────────────────────────────────────────────
 
 function log(msg, kind = "info") {
   els.outputCard.hidden = false;
-  const cls = kind==="ok"?"row-ok":kind==="err"?"row-err":kind==="warn"?"row-warn":"";
+  const cls  = kind==="ok"?"row-ok":kind==="err"?"row-err":kind==="warn"?"row-warn":"";
   const line = document.createElement("div");
   if (cls) line.className = cls;
   line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
   els.output.appendChild(line);
   els.output.scrollTop = els.output.scrollHeight;
 }
-
-// ---------- progress ----------
 
 function updateProgress(done, total) {
   if (!els.progressBar || !els.progressText) return;
@@ -205,20 +222,24 @@ function showProgress(show) {
   if (els.progressWrap) els.progressWrap.hidden = !show;
 }
 
-// ---------- folder picker ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// Folder picker
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function pickFolder() {
   try {
     downloadDirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
     els.folderStatus.textContent = `📁 Saving to: ${downloadDirHandle.name}`;
     els.folderStatus.style.color = "var(--ok)";
-    log(`Output folder set: "${downloadDirHandle.name}"`, "ok");
+    log(`Output folder set: "${downloadDirHandle.name}" — files will save here instead of a master ZIP.`, "ok");
   } catch(e) {
     if (e.name !== "AbortError") log(`Folder picker error: ${e.message}`, "err");
   }
 }
 
-// ---------- API helpers ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// API helpers
+// ─────────────────────────────────────────────────────────────────────────────
 
 function buildPayload(row) {
   return {
@@ -264,6 +285,10 @@ function extractDownloadUrl(json, preferredProduct) {
          json?.downloadUrl || json?.url || json?.signedUrl || null;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// File utilities
+// ─────────────────────────────────────────────────────────────────────────────
+
 function saveBlob(blob, filename) {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -276,60 +301,51 @@ function safeName(s, fb = "download") {
   return (String(s || fb).replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim()) || fb;
 }
 
-/** Recursively get-or-create a nested directory handle. */
 async function getNestedDir(root, ...parts) {
   let dir = root;
-  for (const part of parts) {
+  for (const part of parts)
     dir = await dir.getDirectoryHandle(safeName(part, "unknown"), { create: true });
-  }
   return dir;
 }
 
-/**
- * Write blob into  root/enterpriseId/teamId/vin/images/<fname>
- * If the blob is a ZIP, extract its entries directly into the images/ folder.
- */
+// Write a blob into  folderRoot/enterpriseId/teamId/vin/
+// If the blob is itself a ZIP, extract its contents directly into that folder.
 async function writeBlobToFolder(blob, fname, label, row) {
-  const imagesDir = await getNestedDir(
+  const targetDir = await getNestedDir(
     downloadDirHandle,
     row.enterpriseId || "unknown_enterprise",
     row.teamId       || "unknown_team",
     row.vin || row.mediaId
   );
+  const pathStr = `${downloadDirHandle.name}/${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/`;
 
-  const path = `${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/`;
-
-  // If it's a ZIP, extract entries directly into images/
   if (fname.endsWith(".zip") && typeof JSZip === "function") {
     try {
-      const zip = await JSZip.loadAsync(blob);
+      const zip     = await JSZip.loadAsync(blob);
       const entries = Object.values(zip.files).filter(f => !f.dir);
       for (const entry of entries) {
         const entryBlob = await entry.async("blob");
-        const entryName = entry.name.split("/").pop(); // strip any sub-path inside the zip
-        const fh = await imagesDir.getFileHandle(safeName(entryName, "file"), { create: true });
+        const entryName = entry.name.split("/").pop();
+        const fh = await targetDir.getFileHandle(safeName(entryName, "file"), { create: true });
         const w  = await fh.createWritable();
         await w.write(entryBlob); await w.close();
       }
-      log(`  ✓ ${label}: extracted ${entries.length} image(s) → ${path}`, "ok");
+      log(`  ✓ ${label}: extracted ${entries.length} image(s) → ${pathStr}`, "ok");
       return;
     } catch(e) {
-      log(`  ZIP extraction failed (${e.message}), saving raw file instead.`, "warn");
+      log(`  ZIP extraction failed (${e.message}), saving raw ZIP file instead.`, "warn");
     }
   }
 
-  // Fallback: write the file as-is
-  const fh = await imagesDir.getFileHandle(fname, { create: true });
+  const fh = await targetDir.getFileHandle(fname, { create: true });
   const w  = await fh.createWritable();
   await w.write(blob); await w.close();
-  log(`  ✓ ${label}: saved → ${path}${fname} (${(blob.size/1024/1024).toFixed(2)} MB)`, "ok");
+  log(`  ✓ ${label}: saved → ${pathStr}${fname} (${(blob.size/1024/1024).toFixed(2)} MB)`, "ok");
 }
 
-// ---------- master ZIP (mutex-protected for parallel safety) ----------
-
-let masterZip = null;
-let masterZipEntries = 0;
-let zipMutex = Promise.resolve();
+// ─────────────────────────────────────────────────────────────────────────────
+// Master ZIP (used only in ZIP mode, mutex-protected for parallel safety)
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function addToMasterZip(fname, blob, row) {
   const basePath = [
@@ -339,21 +355,18 @@ async function addToMasterZip(fname, blob, row) {
   ].join("/") + "/";
 
   zipMutex = zipMutex.then(async () => {
-    // If it's a ZIP, extract entries into the images/ folder
     if (fname.endsWith(".zip") && typeof JSZip === "function") {
       try {
-        const inner = await JSZip.loadAsync(blob);
+        const inner   = await JSZip.loadAsync(blob);
         const entries = Object.values(inner.files).filter(f => !f.dir);
         for (const entry of entries) {
           const entryName = entry.name.split("/").pop();
-          const data = await entry.async("arraybuffer");
+          const data      = await entry.async("arraybuffer");
           masterZip.file(basePath + safeName(entryName, "file"), data);
         }
         masterZipEntries++;
         return;
-      } catch(e) {
-        // fall through to raw file
-      }
+      } catch(e) { /* fall through */ }
     }
     masterZip.file(basePath + fname, blob);
     masterZipEntries++;
@@ -361,64 +374,100 @@ async function addToMasterZip(fname, blob, row) {
   return zipMutex;
 }
 
-// ---------- blob fetch ----------
+async function finalizeMasterZip() {
+  if (!masterZip) return;
+  if (masterZipEntries === 0) {
+    log("No files collected into master ZIP. Check proxy URL and auth token.", "warn");
+    masterZip = null; return;
+  }
+  log(`Building master ZIP with ${masterZipEntries} VIN${masterZipEntries===1?"":"s"}…`);
+  try {
+    const blob  = await masterZip.generateAsync({ type: "blob", compression: "STORE" });
+    const stamp = new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
+    saveBlob(blob, `spyne-downloads-${stamp}.zip`);
+    log(`✓ Master ZIP saved: spyne-downloads-${stamp}.zip (${(blob.size/1024/1024).toFixed(2)} MB, ${masterZipEntries} VINs).`, "ok");
+  } catch(e) { log(`Could not build master ZIP: ${e.message}`, "err"); }
+  masterZip = null; masterZipEntries = 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Blob fetching
+// Always tries the Cloudflare proxy /fetch-url first (bypasses S3 CORS).
+// Falls back to direct fetch as a best-effort (works only if S3 allows CORS).
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function fetchBlob(signedUrl) {
+  // Route 1: proxy /fetch-url (recommended — avoids S3 CORS entirely)
   const proxyEndpoint = fetchUrlProxyEndpoint();
   if (proxyEndpoint) {
     try {
       const res = await fetch(proxyEndpoint, {
-        method: "POST",
+        method:  "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ url: signedUrl }),
+        body:    JSON.stringify({ url: signedUrl }),
       });
       if (!res.ok) throw new Error(`proxy HTTP ${res.status}`);
       return await res.blob();
     } catch(e) {
-      log(`  Proxy fetch failed (${e.message}). Trying direct…`, "warn");
+      log(`  Proxy /fetch-url failed (${e.message}). Trying direct fetch…`, "warn");
     }
   }
+
+  // Route 2: direct (only works if Spyne's S3 allows CORS for this origin)
   try {
     const res = await fetch(signedUrl, { mode: "cors" });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.blob();
   } catch(e) {
-    log(`  Direct fetch failed (CORS blocked). ${downloadDirHandle ? "Folder picker needs a proxy URL (Option A) to fetch blobs — set one above." : "Set a proxy URL (Option A) to fix this."}`, "warn");
+    log(`  Direct fetch blocked (CORS). ${proxyEndpoint ? "Proxy also failed — check worker URL." : "No proxy set — paste your Cloudflare Worker URL above."}`, "warn");
     return null;
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// THE SINGLE DELIVERY FUNCTION
+// All download paths funnel here. Mode is decided once, cleanly.
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function deliverDownload(signedUrl, row, label) {
+  const mode  = getMode();
   const fname = `${safeName(row.vin || row.mediaId)}.zip`;
-  const blob  = await fetchBlob(signedUrl);
 
-  if (!blob) {
-    // Blob fetch failed (CORS). If folder picker is active, we can't write to it either.
-    // Open in tab as the only cross-origin option the browser allows.
+  if (mode === "TAB") {
+    // No proxy, no folder — can't fetch blob. Open in tab.
     window.open(signedUrl, "_blank", "noopener");
-    log(`  ⚠ ${label}: CORS blocked blob fetch — opened in new tab. To save to your folder, also set a Proxy URL in Option A above.`, "warn");
+    log(`  ↗ ${label}: no proxy set — opened in new tab.`, "warn");
     return;
   }
 
-  // Folder picker takes priority when a folder is selected
-  if (downloadDirHandle) {
-    try { await writeBlobToFolder(blob, fname, label, row); return; }
-    catch(e) { log(`  Folder write failed (${e.message}). Saving flat.`, "warn"); }
-  }
-
-  // Proxy mode: add to master ZIP (only when proxy URL is configured)
-  if (masterZip && proxyBase()) {
-    await addToMasterZip(fname, blob, row);
-    log(`  ✓ ${label}: queued → ${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/`, "ok");
+  // Fetch the blob (via proxy if available)
+  const blob = await fetchBlob(signedUrl);
+  if (!blob) {
+    // fetchBlob already logged why it failed. Fall back to tab.
+    window.open(signedUrl, "_blank", "noopener");
+    log(`  ↗ ${label}: blob fetch failed — opened in new tab as fallback.`, "warn");
     return;
   }
 
-  // Last resort: flat save to default Downloads
-  saveBlob(blob, fname);
-  log(`  ✓ ${label}: saved ${fname} (${(blob.size/1024/1024).toFixed(2)} MB) to default Downloads.`, "ok");
+  if (mode === "FOLDER") {
+    // FOLDER mode: write directly into the chosen folder
+    try {
+      await writeBlobToFolder(blob, fname, label, row);
+    } catch(e) {
+      log(`  ✗ ${label}: folder write failed (${e.message}). Saving to Downloads instead.`, "err");
+      saveBlob(blob, fname);
+    }
+    return;
+  }
+
+  // ZIP mode: accumulate into master ZIP
+  await addToMasterZip(fname, blob, row);
+  log(`  ✓ ${label}: added to master ZIP → ${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/`, "ok");
 }
 
-// ---------- per-VIN polling ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-VIN polling
+// ─────────────────────────────────────────────────────────────────────────────
 
 const R_DONE    = "downloaded";
 const R_PENDING = "pending";
@@ -426,10 +475,10 @@ const R_FAILED  = "failed";
 
 async function fetchPerMedia(row, requestId, token, { quiet = false } = {}) {
   const label = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
-  const res = await fetch(perMediaGetUrl(row.mediaId, requestId), {
-    method: "GET",
+  const res   = await fetch(perMediaGetUrl(row.mediaId, requestId), {
+    method:  "GET",
     headers: {
-      accept: "application/json, text/plain, */*",
+      accept:        "application/json, text/plain, */*",
       authorization: token.startsWith("Bearer ") ? token : `Bearer ${token}`,
       "x-request-id": newUUID(),
     },
@@ -447,16 +496,17 @@ async function fetchPerMedia(row, requestId, token, { quiet = false } = {}) {
     return R_FAILED;
   }
 
+  // JSON response: extract download URL or check status
   if (ctype.includes("application/json")) {
-    const json = await res.json().catch(() => null);
+    const json    = await res.json().catch(() => null);
     const PENDING = ["pending","in_progress","yet_to_start","queued","processing"];
     const overallStatus = (json?.data?.status || json?.status || "").toLowerCase();
-    const products = json?.data?.products || json?.products;
+    const products      = json?.data?.products || json?.products;
     let downloadUrl = null, anyPending = false;
     if (products && typeof products === "object") {
       const preferred = els.downloadProduct?.value;
       const keys = preferred && products[preferred]
-        ? [preferred, ...Object.keys(products).filter(k=>k!==preferred)]
+        ? [preferred, ...Object.keys(products).filter(k => k !== preferred)]
         : Object.keys(products);
       for (const k of keys) {
         const p = products[k] || {};
@@ -478,23 +528,21 @@ async function fetchPerMedia(row, requestId, token, { quiet = false } = {}) {
     return R_FAILED;
   }
 
-  // Binary response
-  const blob = await res.blob();
-  const ext  = ctype.includes("zip") ? "zip" : "bin";
+  // Binary response: API returned the file directly (no signed URL step)
+  const blob  = await res.blob();
+  const ext   = ctype.includes("zip") ? "zip" : "bin";
   const fname = `${safeName(row.vin || row.mediaId)}.${ext}`;
-  // Mode B — folder picker (no proxy needed)
-  if (downloadDirHandle) {
+  const mode  = getMode();
+  if (mode === "FOLDER" && downloadDirHandle) {
     try { await writeBlobToFolder(blob, fname, label, row); return R_DONE; }
-    catch(e) { log(`  Folder write failed (${e.message}). Falling back.`, "warn"); }
-  }
-  // Mode A — proxy ZIP
-  if (masterZip && proxyBase()) {
+    catch(e) { log(`  Folder write failed (${e.message}). Saving to Downloads.`, "warn"); }
+  } else if (mode === "ZIP" && masterZip) {
     await addToMasterZip(fname, blob, row);
-    log(`  ✓ ${label}: added to master ZIP under ${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/`, "ok");
+    log(`  ✓ ${label}: added to master ZIP → ${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/`, "ok");
     return R_DONE;
   }
   saveBlob(blob, fname);
-  log(`  ✓ ${label}: saved ${fname} (${(blob.size/1024/1024).toFixed(2)} MB) to default Downloads.`, "ok");
+  log(`  ✓ ${label}: saved ${fname} (${(blob.size/1024/1024).toFixed(2)} MB) to Downloads.`, "ok");
   return R_DONE;
 }
 
@@ -510,7 +558,7 @@ async function pollOne(row, requestId, token, idx, total) {
       await new Promise(r => setTimeout(r, wait));
     }
     let result;
-    try { result = await fetchPerMedia(row, requestId, token, { quiet: attempt>1 }); }
+    try { result = await fetchPerMedia(row, requestId, token, { quiet: attempt > 1 }); }
     catch(e) { log(`${prefix}   ✗ ${label}: ${e.message}`, "err"); return false; }
     if (result === R_DONE)   { log(`${prefix}   ✓ ${label}: done after ${((Date.now()-t0)/1000).toFixed(1)}s.`, "ok"); return true; }
     if (result === R_FAILED) { log(`${prefix}   ✗ ${label}: hard failure.`, "err"); return false; }
@@ -520,60 +568,23 @@ async function pollOne(row, requestId, token, idx, total) {
   return false;
 }
 
-// ---------- parallel pool ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// Parallel pool
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function runPool(tasks, concurrency) {
   let nextIdx = 0;
   async function worker() {
-    while (nextIdx < tasks.length) {
-      const i = nextIdx++;
-      await tasks[i]();
-    }
+    while (nextIdx < tasks.length) { const i = nextIdx++; await tasks[i](); }
   }
   const workers = [];
   for (let w = 0; w < Math.min(concurrency, tasks.length); w++) workers.push(worker());
   await Promise.all(workers);
 }
 
-// ---------- state for re-fetch ----------
-
-let lastRows = [];
-let lastRequestIdsByMedia = new Map();
-
-// ---------- finalize master ZIP ----------
-
-async function finalizeMasterZip() {
-  if (!masterZip) return;
-  if (masterZipEntries === 0) {
-    log("No files were collected. Check your proxy URL and auth token.", "warn");
-    masterZip = null; return;
-  }
-  log(`Building master ZIP with ${masterZipEntries} VIN${masterZipEntries===1?"":"s"}…`);
-  try {
-    const blob = await masterZip.generateAsync({ type: "blob", compression: "STORE" });
-    const stamp = new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
-    saveBlob(blob, `spyne-downloads-${stamp}.zip`);
-    log(`✓ Master ZIP saved: spyne-downloads-${stamp}.zip (${(blob.size/1024/1024).toFixed(2)} MB, ${masterZipEntries} VINs).`, "ok");
-  } catch(e) { log(`Could not build master ZIP: ${e.message}`, "err"); }
-  masterZip = null; masterZipEntries = 0;
-}
-
-// ---------- mode announcement ----------
-
-function announceMode(concurrency) {
-  const cStr = `(${concurrency} parallel)`;
-  if (downloadDirHandle && proxyBase()) {
-    log(`Mode: PROXY (fetch) + FOLDER PICKER (save) → "${downloadDirHandle.name}/"  ${cStr}`, "ok");
-  } else if (downloadDirHandle) {
-    log(`Mode: FOLDER PICKER → "${downloadDirHandle.name}/"  ${cStr} — ⚠ No proxy set; S3 CORS may block downloads.`, "warn");
-  } else if (proxyBase()) {
-    log(`Mode: PROXY → master ZIP  [${proxyBase()}]  ${cStr}`, "ok");
-  } else {
-    log(`Mode: TAB FALLBACK — files go to default Downloads. Set a proxy URL or choose a folder above.  ${cStr}`, "warn");
-  }
-}
-
-// ---------- process one VIN ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// Process one VIN
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function processVin(row, token, idx, total) {
   const label = row.vin ? `${row.mediaId} (VIN ${row.vin})` : row.mediaId;
@@ -581,17 +592,17 @@ async function processVin(row, token, idx, total) {
   log(`${tag} POST /medias/${row.mediaId}/download …`);
   try {
     const postRes = await fetch(perVinPostUrl(row.mediaId), {
-      method: "POST",
+      method:  "POST",
       headers: apiHeaders(token),
-      body: JSON.stringify(buildPayload(row)),
-      mode: "cors",
+      body:    JSON.stringify(buildPayload(row)),
+      mode:    "cors",
     });
     if (!postRes.ok) {
       const txt = await postRes.text().catch(() => postRes.statusText);
       log(`${tag}   ✗ POST HTTP ${postRes.status} — ${txt.slice(0,240)}`, "err");
       return false;
     }
-    const json = await postRes.json().catch(() => null);
+    const json      = await postRes.json().catch(() => null);
     const directUrl = extractDownloadUrl(json, els.downloadProduct.value);
     if (typeof directUrl === "string" && directUrl.startsWith("http")) {
       await deliverDownload(directUrl, row, label);
@@ -606,18 +617,20 @@ async function processVin(row, token, idx, total) {
     log(`${tag}   POST accepted (requestId ${requestId}). Polling…`);
     return await pollOne(row, requestId, token, idx, total);
   } catch(e) {
-    log(`${tag}   ✗ ${e.message?.includes("Failed to fetch") ? "Network/CORS error. See README → proxy setup." : e.message}`, "err");
+    log(`${tag}   ✗ ${e.message?.includes("Failed to fetch") ? "Network/CORS error — check proxy URL." : e.message}`, "err");
     return false;
   }
 }
 
-// ---------- main download ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// Main download click
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function onDownloadClick() {
   els.output.innerHTML = "";
   els.outputCard.hidden = false;
   const token = els.authToken.value.trim();
-  if (!token) return log("Authorization token is required.", "err");
+  if (!token)          return log("Authorization token is required.", "err");
   if (!parsedRows.length) return log("Upload a CSV with at least one media ID.", "err");
   const bad = parsedRows.filter(r => !r.enterpriseId || !r.teamId);
   if (bad.length) return log(`${bad.length} row(s) missing Enterprise/Team ID. Fix CSV and re-upload.`, "err");
@@ -625,84 +638,95 @@ async function onDownloadClick() {
   saveCreds();
   lastRows = parsedRows.slice();
   lastRequestIdsByMedia = new Map();
-  zipMutex = Promise.resolve();
-  // Skip master ZIP when folder picker is active — blobs go directly to the chosen folder.
-  masterZip = (!downloadDirHandle && typeof JSZip === "function") ? new JSZip() : null;
+  zipMutex       = Promise.resolve();
   masterZipEntries = 0;
-  if (!masterZip && !downloadDirHandle) log("JSZip didn't load (CDN blocked?). Blobs will be saved individually.", "warn");
+
+  const mode = getMode();
+  // Only create a master ZIP in ZIP mode
+  masterZip = (mode === "ZIP" && typeof JSZip === "function") ? new JSZip() : null;
+  if (mode === "ZIP" && !masterZip) log("JSZip didn't load (CDN blocked?). Blobs will be saved individually.", "warn");
 
   const concurrency = getConcurrency();
-  announceMode(concurrency);
-  log(`Processing ${parsedRows.length} VIN${parsedRows.length===1?"":"s"} with concurrency=${concurrency}…`);
+
+  // Log which mode we're running in so it's visible in the status panel
+  if (mode === "FOLDER") {
+    log(`Mode: FOLDER PICKER → files will be extracted into "${downloadDirHandle.name}/" (${concurrency} parallel)`, "ok");
+  } else if (mode === "ZIP") {
+    log(`Mode: PROXY + master ZIP [${proxyBase()}] (${concurrency} parallel)`, "ok");
+  } else {
+    log(`Mode: TAB FALLBACK — set a proxy URL and/or pick a folder above. (${concurrency} parallel)`, "warn");
+  }
+
+  log(`Processing ${parsedRows.length} VIN${parsedRows.length===1?"":"s"}…`);
   showProgress(true);
   updateProgress(0, parsedRows.length);
-
   els.downloadBtn.disabled = true;
   els.refetchBtn.hidden = false;
-  const t0 = Date.now(); let ok = 0, fail = 0, done = 0;
 
+  const t0 = Date.now(); let ok = 0, fail = 0, done = 0;
   const tasks = parsedRows.map((row, i) => async () => {
     const result = await processVin(row, token, i, parsedRows.length);
-    done++;
-    result ? ok++ : fail++;
+    done++; result ? ok++ : fail++;
     updateProgress(done, parsedRows.length);
   });
 
   try { await runPool(tasks, concurrency); }
   finally { els.downloadBtn.disabled = false; }
 
-  log(`Done in ${((Date.now()-t0)/1000).toFixed(1)}s — Success: ${ok}  Failed: ${fail}`, fail ? "warn" : "ok");
+  log(`Done in ${((Date.now()-t0)/1000).toFixed(1)}s — ✓ ${ok}  ✗ ${fail}`, fail ? "warn" : "ok");
   showProgress(false);
   await finalizeMasterZip();
 }
 
-// ---------- re-fetch ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// Re-fetch
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function onRefetchClick() {
   if (!lastRequestIdsByMedia.size) { log("No previous run to re-fetch. Click Download first.", "warn"); return; }
   const token = els.authToken.value.trim();
   if (!token) return log("Authorization token is required.", "err");
 
-  zipMutex = Promise.resolve();
-  masterZip = (!downloadDirHandle && typeof JSZip === "function") ? new JSZip() : null;
+  zipMutex       = Promise.resolve();
   masterZipEntries = 0;
+  const mode = getMode();
+  masterZip  = (mode === "ZIP" && typeof JSZip === "function") ? new JSZip() : null;
 
   const concurrency = getConcurrency();
   showProgress(true);
   updateProgress(0, lastRows.length);
   els.refetchBtn.disabled = true;
   const t0 = Date.now(); let ok = 0, fail = 0, done = 0;
-  log(`Re-fetching ${lastRows.length} VIN${lastRows.length===1?"":"s"} with concurrency=${concurrency}…`);
+  log(`Re-fetching ${lastRows.length} VIN${lastRows.length===1?"":"s"} in ${mode} mode…`);
 
   const tasks = lastRows.map((row, i) => async () => {
     const rid = lastRequestIdsByMedia.get(row.mediaId);
     if (!rid) {
       log(`[${i+1}/${lastRows.length}]   ✗ No requestId for ${row.mediaId}.`, "err");
-      done++; fail++;
-      updateProgress(done, lastRows.length);
-      return;
+      done++; fail++; updateProgress(done, lastRows.length); return;
     }
     log(`[${i+1}/${lastRows.length}] Re-checking ${row.mediaId}${row.vin?` (VIN ${row.vin})`:""}…`);
     const result = await pollOne(row, rid, token, i, lastRows.length);
-    done++;
-    result ? ok++ : fail++;
+    done++; result ? ok++ : fail++;
     updateProgress(done, lastRows.length);
   });
 
   try { await runPool(tasks, concurrency); }
   finally { els.refetchBtn.disabled = false; }
 
-  log(`Re-fetch done in ${((Date.now()-t0)/1000).toFixed(1)}s — Success: ${ok}  Failed: ${fail}`, fail ? "warn" : "ok");
+  log(`Re-fetch done in ${((Date.now()-t0)/1000).toFixed(1)}s — ✓ ${ok}  ✗ ${fail}`, fail ? "warn" : "ok");
   showProgress(false);
   await finalizeMasterZip();
 }
 
-// ---------- wire up ----------
+// ─────────────────────────────────────────────────────────────────────────────
+// Bootstrap
+// ─────────────────────────────────────────────────────────────────────────────
 
 document.addEventListener("DOMContentLoaded", () => {
   loadCreds();
   if (!("showDirectoryPicker" in window)) {
-    if (els.pickFolderBtn) els.pickFolderBtn.hidden = true;
+    if (els.pickFolderBtn)     els.pickFolderBtn.hidden = true;
     if (els.folderUnsupported) els.folderUnsupported.hidden = false;
   }
   els.csvFile.addEventListener("change", e => { const f = e.target.files?.[0]; if (f) loadCSVFile(f); });
