@@ -383,7 +383,7 @@ async function fetchBlob(signedUrl) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.blob();
   } catch(e) {
-    log(`  Direct fetch also failed (${e.message}).`, "warn");
+    log(`  Direct fetch failed (CORS blocked). ${downloadDirHandle ? "Folder picker needs a proxy URL (Option A) to fetch blobs — set one above." : "Set a proxy URL (Option A) to fix this."}`, "warn");
     return null;
   }
 }
@@ -393,13 +393,14 @@ async function deliverDownload(signedUrl, row, label) {
   const blob  = await fetchBlob(signedUrl);
 
   if (!blob) {
-    // Cannot fetch bytes — open in tab as last resort
+    // Blob fetch failed (CORS). If folder picker is active, we can't write to it either.
+    // Open in tab as the only cross-origin option the browser allows.
     window.open(signedUrl, "_blank", "noopener");
-    log(`  ⚠ ${label}: could not fetch blob (no proxy?). Opened in tab instead.`, "warn");
+    log(`  ⚠ ${label}: CORS blocked blob fetch — opened in new tab. To save to your folder, also set a Proxy URL in Option A above.`, "warn");
     return;
   }
 
-  // Folder picker takes priority when a folder is selected (no proxy needed)
+  // Folder picker takes priority when a folder is selected
   if (downloadDirHandle) {
     try { await writeBlobToFolder(blob, fname, label, row); return; }
     catch(e) { log(`  Folder write failed (${e.message}). Saving flat.`, "warn"); }
