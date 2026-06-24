@@ -47,8 +47,9 @@
     <section class="card">
       <h2>3. Download destination</h2>
       <p class="hint">
-        Choose <strong>one</strong> option. The proxy gives a single master ZIP (recommended).
-        The folder picker saves each VIN ZIP directly into a folder you choose — no proxy needed.
+        The proxy URL (Option A) is <strong>required</strong> to fetch blobs — Spyne's S3 URLs
+        block direct browser requests (CORS). Set the proxy URL, then optionally also choose a
+        folder (Option B) to save files there instead of a master ZIP.
         If neither is set, each VIN opens in a new browser tab.
       </p>
 
@@ -56,9 +57,9 @@
 
         <div class="dest-option" id="dest-proxy-block">
           <div class="dest-label">
-            <span class="dest-badge">Option A</span>
+            <span class="dest-badge">Required</span>
             <strong>Cloudflare Worker proxy</strong>
-            <small class="muted"> — all VINs bundled into one master ZIP download</small>
+            <small class="muted"> — needed to fetch blobs (bypasses S3 CORS restriction)</small>
           </div>
           <label>
             <span>Worker URL</span>
@@ -74,14 +75,18 @@
           </p>
         </div>
 
-        <div class="dest-divider">— or —</div>
+        <div class="dest-divider">— and optionally —</div>
 
         <div class="dest-option" id="dest-folder-block">
           <div class="dest-label">
             <span class="dest-badge">Option B</span>
             <strong>Folder picker</strong>
-            <small class="muted"> — each VIN ZIP saved directly to a folder you choose</small>
+            <small class="muted"> — save each VIN directly to a folder instead of a master ZIP</small>
           </div>
+          <p class="hint" style="margin-top:0; margin-bottom:8px">
+            Set the proxy URL above first, then choose a folder. Files will be saved as
+            <code>enterpriseId/teamId/VIN/</code> inside your chosen folder.
+          </p>
           <div class="actions" style="margin:10px 0 4px">
             <button id="pick-folder-btn" class="ghost">Choose folder&hellip;</button>
           </div>
