@@ -626,9 +626,10 @@ async function onDownloadClick() {
   lastRows = parsedRows.slice();
   lastRequestIdsByMedia = new Map();
   zipMutex = Promise.resolve();
-  masterZip = (typeof JSZip === "function") ? new JSZip() : null;
+  // Skip master ZIP when folder picker is active — blobs go directly to the chosen folder.
+  masterZip = (!downloadDirHandle && typeof JSZip === "function") ? new JSZip() : null;
   masterZipEntries = 0;
-  if (!masterZip) log("JSZip didn't load (CDN blocked?). Blobs will be saved individually.", "warn");
+  if (!masterZip && !downloadDirHandle) log("JSZip didn't load (CDN blocked?). Blobs will be saved individually.", "warn");
 
   const concurrency = getConcurrency();
   announceMode(concurrency);
@@ -663,7 +664,7 @@ async function onRefetchClick() {
   if (!token) return log("Authorization token is required.", "err");
 
   zipMutex = Promise.resolve();
-  masterZip = (typeof JSZip === "function") ? new JSZip() : null;
+  masterZip = (!downloadDirHandle && typeof JSZip === "function") ? new JSZip() : null;
   masterZipEntries = 0;
 
   const concurrency = getConcurrency();
