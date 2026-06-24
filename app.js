@@ -399,17 +399,17 @@ async function deliverDownload(signedUrl, row, label) {
     return;
   }
 
-  // Always try to add to master ZIP with nested structure (proxy mode)
-  if (masterZip) {
-    await addToMasterZip(fname, blob, row);
-    log(`  ✓ ${label}: queued → ${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/`, "ok");
-    return;
-  }
-
-  // Folder picker active
+  // Folder picker takes priority when a folder is selected (no proxy needed)
   if (downloadDirHandle) {
     try { await writeBlobToFolder(blob, fname, label, row); return; }
     catch(e) { log(`  Folder write failed (${e.message}). Saving flat.`, "warn"); }
+  }
+
+  // Proxy mode: add to master ZIP (only when proxy URL is configured)
+  if (masterZip && proxyBase()) {
+    await addToMasterZip(fname, blob, row);
+    log(`  ✓ ${label}: queued → ${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/`, "ok");
+    return;
   }
 
   // Last resort: flat save to default Downloads
@@ -481,12 +481,12 @@ async function fetchPerMedia(row, requestId, token, { quiet = false } = {}) {
   const blob = await res.blob();
   const ext  = ctype.includes("zip") ? "zip" : "bin";
   const fname = `${safeName(row.vin || row.mediaId)}.${ext}`;
-  // Mode B first
+  // Mode B — folder picker (no proxy needed)
   if (downloadDirHandle) {
     try { await writeBlobToFolder(blob, fname, label, row); return R_DONE; }
     catch(e) { log(`  Folder write failed (${e.message}). Falling back.`, "warn"); }
   }
-  // Mode A
+  // Mode A — proxy ZIP
   if (masterZip && proxyBase()) {
     await addToMasterZip(fname, blob, row);
     log(`  ✓ ${label}: added to master ZIP under ${row.enterpriseId}/${row.teamId}/${row.vin || row.mediaId}/`, "ok");
